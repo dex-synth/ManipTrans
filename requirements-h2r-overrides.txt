@@ -1,3 +1,6 @@
 # Gym's optional classic-control renderer pins a release without Python 3.11 wheels.
 # ManipTrans uses neither this renderer nor Gym's classic-control environments.
 pygame==2.6.1
+# rl-games 1.6.1's optional W&B logger predates mjlab's dependency. H2R uses
+# TensorBoard only; PPO does not import/use the W&B training integration.
+wandb==0.22.3

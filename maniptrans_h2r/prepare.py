@@ -218,12 +218,17 @@ def main():
     parser.add_argument("--robot-bundle")
     parser.add_argument("--output", required=True)
     parser.add_argument("--object", action="append", default=[], metavar="SIDE=PART")
-    parser.add_argument("--iterations", type=int, default=2000)
+    parser.add_argument("--iterations", type=int, default=4000)
+    parser.add_argument("--legacy-v1", action="store_true", help="Explicit legacy single-demonstration preparation")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     if args.iterations < 1:
         parser.error("--iterations must be positive")
-    prepare(args)
+    if args.legacy_v1:
+        prepare(args)
+    else:
+        from .prepare_v2 import prepare as prepare_v2
+        prepare_v2(args)
 
 
 if __name__ == "__main__":

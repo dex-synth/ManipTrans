@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 import random
 import shutil
+import sys
 
 import numpy as np
 import torch
@@ -65,7 +66,7 @@ def train_stage(prepared, output, stage, sides, bases, args):
     return checkpoint, saved, dimensions, env.action_dim
 
 
-def main():
+def legacy_main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared", required=True)
     parser.add_argument("--output", required=True)
@@ -107,6 +108,16 @@ def main():
          params=params, dimensions=dimensions, action_dim=action_dim, checkpoint=path.name,
          control=control_config(metadata["control_dt_s"]), residual_mean=True, seed=args.seed))
     print(f"Deployment: {output}")
+
+
+def main():
+    if "--train-local-imitators" in sys.argv:
+        sys.argv.remove("--train-local-imitators")
+        return legacy_main()
+    from .training import training_arguments, train_residual
+    parser = argparse.ArgumentParser(description="Train a residual on mjlab using frozen generalist imitators")
+    training_arguments(parser, "residual")
+    train_residual(parser.parse_args())
 
 
 if __name__ == "__main__":

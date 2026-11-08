@@ -28,7 +28,7 @@ def equal(actual, expected, name, rtol=2e-5, atol=1e-9):
         raise ValueError(f"Task physics mismatch: {name} ({actual.shape} vs {expected.shape})")
 
 
-def load_model(task_path, task, robot):
+def load_model(task_path, task, robot, *, all_contacts=False):
     import mujoco
 
     source = task_path / task["scene"]
@@ -49,6 +49,17 @@ def load_model(task_path, task, robot):
     pairs = []
     for side in robot["sides"]:
         for tip, body in enumerate(robot["hands"][side]["contact_bodies"]):
+            if all_contacts:
+                # Exact geom selectors avoid including a fingertip body's descendants.
+                for geom in range(nominal.ngeom):
+                    if (nominal.geom_bodyid[geom] != nominal.body(body).id
+                            or not (nominal.geom_contype[geom] or nominal.geom_conaffinity[geom])):
+                        continue
+                    name = f"mt_contact_{len(pairs)}"
+                    ET.SubElement(sensors, "contact", name=name, geom1=nominal.geom(geom).name,
+                                  reduce="none", num=str(CAPACITY + 1), data="found force dist pos normal tangent")
+                    pairs.append((side, tip, name))
+                continue
             selections = [{"body2": b} for b in task["object"]["parts"].values()]
             for env in task.get("environment", {}).values():
                 selections.extend([{"geom2": g} for g in env["collision_geoms"]] if env["body"] == "world"

@@ -1,4 +1,7 @@
-# Independent MJWarp environment; native IsaacGym requirements remain separate.
+# Independent mjlab environment; native IsaacGym requirements remain separate.
+mjlab==1.6.0
+smplx==0.1.28
+chumpy==0.70
 torch==2.9.0
 numpy==1.26.4
 mujoco==3.11.0

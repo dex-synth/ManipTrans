@@ -73,3 +73,20 @@ def weight_indices():
     result["level_1_joints"] = [1, 5, 9, 13, 17]
     result["level_2_joints"] = [i for i in range(1, 21) if i % 4 in (2, 3)]
     return result
+
+
+def command_limits(model, robot):
+    """Finite JSON bounds: unbounded wrists use the largest representable float32."""
+    bound = float(np.finfo(np.float32).max)
+    lower, upper = np.full(len(robot["joint_names"]), -bound), np.full(len(robot["joint_names"]), bound)
+    for hand in robot["hands"].values():
+        ids = hand["indices"][6:]
+        lower[ids], upper[ids] = np.asarray(robot["lower"])[ids], np.asarray(robot["upper"])[ids]
+    for actuator, joint in zip(robot["actuator_indices"], robot["ctrl_joint_indices"]):
+        if model.actuator_ctrllimited[actuator]:
+            lower[joint] = max(lower[joint], model.actuator_ctrlrange[actuator, 0])
+            upper[joint] = min(upper[joint], model.actuator_ctrlrange[actuator, 1])
+    if np.any(lower > upper):
+        raise ValueError("Empty joint/actuator command range")
+    robot.update(command_lower=lower.tolist(), command_upper=upper.tolist())
+    return robot

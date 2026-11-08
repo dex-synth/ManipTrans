@@ -1,0 +1,269 @@
+"""Native PPO orchestration with versioned generalist bases and resumable epochs."""
+
+import argparse
+from copy import deepcopy
+import importlib.metadata
+from pathlib import Path
+import random
+import shutil
+import subprocess
+
+import numpy as np
+import torch
+import yaml
+from rl_games.common.algo_observer import AlgoObserver
+from rl_games.common.tr_helpers import DefaultRewardsShaper
+
+from lib.rl.agent import PPOAgent
+from .io import digest, load_artifact, read_json, seal, sha256, write_json
+from .policy import parameters, register
+
+
+def training_arguments(parser, stage):
+    defaults = yaml.safe_load((Path(__file__).parent / "config" / f"{stage}.yaml").read_text())
+    parser.set_defaults(stage=stage, recipe=defaults)
+    parser.add_argument("--prepared", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--device", default="cuda:0")
+    for name in ("worlds", "epochs", "horizon", "mini_epochs", "seed", "save_every", "diagnostic_every"):
+        parser.add_argument("--"+name.replace("_", "-"), type=int, default=defaults[name])
+    parser.add_argument("--small-network", action="store_true")
+    parser.add_argument("--allow-incomplete", action="store_true")
+    parser.add_argument("--resume", type=Path, help="Trusted local resume.pth at a complete PPO epoch")
+    if stage == "residual":
+        parser.add_argument("--imitator-right")
+        parser.add_argument("--imitator-left")
+        parser.add_argument("--allow-smoke-imitator", action="store_true")
+
+
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def frozen_state(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items() if "base_model" in k}
+
+
+class ReproductionAgent(PPOAgent):
+    def __init__(self, params, output, recipe, binding, diagnostic=None):
+        super().__init__("run", params)
+        # Native optimizer includes frozen tensors; keep only trainable residual parameters.
+        self.optimizer = torch.optim.Adam((p for p in self.model.parameters() if p.requires_grad), lr=self.last_lr, eps=1e-8)
+        self.output, self.recipe, self.binding = output, recipe, binding
+        self.diagnostic_callback = diagnostic
+        self.last_diagnostic = -1
+        self.restored_best = None
+        self.frozen_before = frozen_state(self.model)
+
+    def verify_frozen(self):
+        if any(not torch.equal(v, self.model.state_dict()[k].detach().cpu()) for k, v in self.frozen_before.items()):
+            raise RuntimeError("Frozen base parameters or normalization buffers changed")
+
+    def get_full_state_weights(self):
+        state = super().get_full_state_weights()
+        state["h2r"] = dict(binding=self.binding, common_steps=self.vec_env.common_steps,
+            sampler=self.vec_env.sampler_state(), python_rng=random.getstate(), numpy_rng=np.random.get_state(),
+            torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all(),
+            scheduler=deepcopy(vars(self.scheduler)), last_lr=self.last_lr, entropy_coef=self.entropy_coef,
+            last_diagnostic=self.last_diagnostic, world_state_restarted=True)
+        return state
+
+    def restore_local(self, path):
+        state = torch.load(path, map_location=self.ppo_device, weights_only=False)
+        extra = state["h2r"]
+        if extra["binding"] != self.binding:
+            raise ValueError("Resume task/corpus/base/recipe binding differs")
+        self.set_full_state_weights(state)
+        self.restored_best = self.last_mean_rewards
+        self.scheduler.__dict__.update(extra["scheduler"])
+        self.last_lr, self.entropy_coef = extra["last_lr"], extra["entropy_coef"]
+        self.update_lr(self.last_lr)
+        self.vec_env.common_steps = extra["common_steps"]
+        self.vec_env.load_sampler_state(extra["sampler"])
+        random.setstate(extra["python_rng"])
+        np.random.set_state(extra["numpy_rng"])
+        torch.set_rng_state(extra["torch_rng"].cpu())
+        torch.cuda.set_rng_state_all([s.cpu() for s in extra["cuda_rng"]])
+        self.last_diagnostic = extra["last_diagnostic"]
+        self.verify_frozen()
+
+    def env_reset(self):
+        obs = super().env_reset()
+        if self.restored_best is not None:
+            self.last_mean_rewards = self.restored_best
+            self.restored_best = None
+        return obs
+
+    def diagnostic(self):
+        if self.diagnostic_callback is None or self.last_diagnostic == self.epoch_num:
+            return
+        rng = (random.getstate(), np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state_all())
+        mode = self.model.training
+        try:
+            self.diagnostic_callback(self.model, self.epoch_num)
+        finally:
+            random.setstate(rng[0]); np.random.set_state(rng[1])
+            torch.set_rng_state(rng[2]); torch.cuda.set_rng_state_all(rng[3])
+            self.model.train(mode)
+        self.last_diagnostic = self.epoch_num
+
+    def update_epoch(self):
+        # Parent loop has completed frame/best-reward bookkeeping at this point.
+        if self.epoch_num and self.epoch_num % self.recipe["save_every"] == 0:
+            self.save_product(f"epoch-{self.epoch_num}")
+        period = self.recipe["diagnostic_every"]
+        if period and self.epoch_num % period == 0:
+            self.diagnostic()
+        return super().update_epoch()
+
+    def save_product(self, name):
+        self.verify_frozen()
+        torch.save({"model": self.model.state_dict()}, self.output / f"{name}.pth")
+        torch.save(self.get_full_state_weights(), self.output / "resume.pth")
+
+
+def run_training(env, params, args, output, prepared_meta, base_ids=None, diagnostic=None):
+    source_root = Path(__file__).resolve().parent.parent
+    source_files = sorted({*source_root.glob("maniptrans_h2r/**/*.py"), *source_root.glob("maniptrans_h2r/config/*.yaml"),
+                           *source_root.glob("lib/rl/**/*.py"), *source_root.glob("lib/utils/*.py"), source_root / "requirements-h2r.lock"})
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source_root, capture_output=True, text=True, check=False)
+    write_json(output / "source.json", dict(commit=revision.stdout.strip() or None,
+        files={str(p.relative_to(source_root)): sha256(p) for p in source_files},
+        gpu=torch.cuda.get_device_name(args.device), cuda=torch.version.cuda))
+    recipe = dict(args.recipe)
+    for key in ("worlds", "epochs", "horizon", "mini_epochs", "seed", "save_every", "diagnostic_every"):
+        recipe[key] = getattr(args, key)
+    recipe.update(small_network=args.small_network, partial=prepared_meta.get("partial", False),
+                  training_framework="mjlab", physics_engine="mujoco_warp")
+    batch = args.worlds*args.horizon
+    minibatch = min(1024, batch) if args.small_network else 1024
+    if min(args.worlds, args.epochs, args.horizon, args.mini_epochs, args.save_every) < 1 or batch % minibatch:
+        raise ValueError("Require positive sizes and a batch divisible by minibatch (1024 outside smoke mode)")
+    recipe["minibatch"] = minibatch
+    (output / "resolved_config.yaml").write_text(yaml.safe_dump(recipe, sort_keys=True))
+    identity_recipe = {k: v for k, v in recipe.items() if k not in {"epochs", "save_every", "diagnostic_every"}}
+    binding = dict(prepared_id=prepared_meta["id"], recipe_id=digest(identity_recipe), bases=base_ids or {})
+    saved_params = deepcopy(params)
+    config = dict(name=args.stage, full_experiment_name=args.stage, env_name="h2r_mjlab", vec_env=env,
+        env_info=env.get_env_info(), device=args.device, num_actors=args.worlds, train_dir=str(output / "training"),
+        features={"observer": AlgoObserver()}, reward_shaper=DefaultRewardsShaper(scale_value=1),
+        use_pid_control=False, ppo=True, normalize_input=True, normalize_input_excluded_keys=[],
+        normalize_value=True, normalize_advantage=True, value_bootstrap=True,
+        gamma=recipe["gamma"], tau=recipe["tau"], learning_rate=recipe["learning_rate"], lr_schedule=recipe["lr_schedule"],
+        warmup_steps=recipe.get("warmup_steps", 10), start_lr=recipe.get("start_lr", 1e-6),
+        schedule_type="standard", kl_threshold=recipe["kl_threshold"], score_to_win=float("inf"),
+        max_epochs=args.epochs, early_stop_epochs=args.epochs+1, save_best_after=10, save_frequency=0,
+        print_stats=True, grad_norm=1., entropy_coef=0., truncate_grads=True, e_clip=.2,
+        horizon_length=args.horizon, minibatch_size=minibatch, mini_epochs=args.mini_epochs,
+        critic_coef=4, clip_value=True, bounds_loss_coef=.0001, use_soft_clamp=True,
+        store_base_actions=args.stage == "residual", mixed_precision=False, weight_decay=0.)
+    params["config"] = config
+    register()
+    agent = ReproductionAgent(params, output, recipe, binding, diagnostic)
+    if args.resume:
+        agent.restore_local(args.resume)
+        if agent.epoch_num >= args.epochs:
+            raise ValueError("Resume epoch must be below requested total --epochs")
+    before = {k: v.detach().clone() for k, v in agent.model.named_parameters() if v.requires_grad}
+    agent.train()
+    if not any(not torch.equal(v, dict(agent.model.named_parameters())[k]) for k, v in before.items()):
+        raise RuntimeError("No trainable parameter changed")
+    agent.diagnostic()
+    agent.save_product("model")
+    agent.writer.close()
+    write_json(output / "physics_audit.json", env.audit)
+    write_json(output / "training.json", dict(epoch=agent.epoch_num, transitions=agent.frame,
+        common_control_steps=env.common_steps, scale_factor=env.scale,
+        frozen_state_unchanged=True, world_state_restarted=bool(args.resume),
+        versions={p: importlib.metadata.version(p) for p in ("mjlab", "mujoco", "mujoco-warp", "warp-lang", "torch", "rl-games")}))
+    if hasattr(env, "motion"):
+        write_json(output / "sampling.json", dict(visits=env.motion.visits.tolist(), transitions=env.motion.transitions.tolist()))
+    return saved_params, recipe
+
+
+def train_imitator(args):
+    from .imitator_env import ImitatorEnv
+    from .diagnostic import diagnostic_callback
+    torch.set_num_threads(4)
+    seed_all(args.seed)
+    prepared, metadata = load_artifact(args.prepared)
+    output = Path(args.output).resolve()
+    if output.is_relative_to(prepared):
+        raise ValueError("Output must be outside prepared inputs")
+    output.mkdir(parents=True, exist_ok=False)
+    env = ImitatorEnv(prepared, args.worlds, args.device, args.seed, args.allow_incomplete)
+    dimensions = {k: s.shape[0] for k, s in env.observation_space.spaces.items()}
+    params = parameters(dimensions, dimensions, env.sides, {}, env.action_dim, args.small_network)
+    saved, recipe = run_training(env, params, args, output, metadata,
+        diagnostic=diagnostic_callback(prepared, output, args.device, args.allow_incomplete, args.epochs))
+    for name in ("robot_mapping.json", "compatibility.json", "motion_manifest.json", "diagnostic_manifest.json", "robot_scene.xml"):
+        shutil.copy2(prepared / name, output / name)
+    shutil.copytree(prepared / "assets", output / "assets")
+    seal(output, "imitator.json", dict(format="maniptrans-h2r-imitator-v1", side=metadata["side"],
+        prepared_id=metadata["id"], corpus_id=metadata["corpus_id"], compatibility=metadata["compatibility"],
+        control=dict(schema="virtual-wrist-position-v2", moving_average=1., wrist_translation_m=.05, wrist_rotation_rad=.3),
+        smoke=bool(args.small_network or metadata["partial"]), params=saved, dimensions=dimensions,
+        action_dim=env.action_dim, checkpoint="model.pth", recipe=recipe))
+    print(f"Generalist imitator: {output}")
+
+
+def train_residual(args):
+    from .residual_env import ResidualEnv
+    from .mjlab_env import CONTROL
+    torch.set_num_threads(4)
+    seed_all(args.seed)
+    prepared, metadata = load_artifact(args.prepared)
+    robot = read_json(prepared / "robot_mapping.json")
+    bases, manifests = {}, {}
+    for side in robot["sides"]:
+        path = getattr(args, f"imitator_{side}")
+        if not path:
+            raise ValueError(f"Residual training requires --imitator-{side}; no local base is trained implicitly")
+        root, manifest = load_artifact(path, "imitator.json")
+        if manifest["format"] != "maniptrans-h2r-imitator-v1" or manifest["side"] != side:
+            raise ValueError("Wrong imitator format or hand side")
+        if manifest["smoke"] and not args.allow_smoke_imitator:
+            raise ValueError("Smoke base requires --allow-smoke-imitator")
+        if manifest["compatibility"] != metadata["compatibility"][side] or manifest["control"] != CONTROL:
+            raise ValueError(f"Incompatible {side} base physics/reference/control signature")
+        bases[side], manifests[side] = root, manifest
+    output = Path(args.output).resolve()
+    if output.is_relative_to(prepared):
+        raise ValueError("Output must be outside prepared inputs")
+    output.mkdir(parents=True, exist_ok=False)
+    shutil.copytree(prepared, output / "prepared")
+    checkpoints = {}
+    for side, root in bases.items():
+        target = output / f"{side}-base.pth"
+        shutil.copy2(root / manifests[side]["checkpoint"], target)
+        write_json(output / f"{side}-base.json", manifests[side])
+        checkpoints[side] = str(target)
+    env = ResidualEnv(output / "prepared", args.worlds, args.device, args.seed)
+    dimensions = {k: s.shape[0] for k, s in env.observation_space.spaces.items()}
+    for manifest in manifests.values():
+        if manifest["dimensions"] != env.features.base_dimensions:
+            raise ValueError("Base feature order/dimensions differ")
+    params = parameters(dimensions, env.features.base_dimensions, env.sides, checkpoints, env.action_dim, args.small_network)
+    continuous = params["network"]["space"]["continuous"]
+    continuous["mu_init"] = dict(name="glorot_normal_initializer", gain=.01)
+    continuous["sigma_init"] = dict(name="const_initializer", val=-1)
+    first = manifests[env.sides[0]]["params"]["network"]
+    params["network"]["base_model"].update(deepcopy(first))
+    for side, prefix in (("right", "rh"), ("left", "lh")):
+        if side in manifests:
+            params["network"][f"{prefix}_base_model"] = deepcopy(manifests[side]["params"]["network"])
+    saved, recipe = run_training(env, params, args, output, metadata, {s: m["id"] for s, m in manifests.items()})
+    for side, prefix in (("right", "rh"), ("left", "lh")):
+        if side in bases:
+            saved["model"][f"{prefix}_base_model_checkpoint"] = f"{side}-base.pth"
+            saved["network"]["base_model"][f"{prefix}_checkpoint"] = f"{side}-base.pth"
+    seal(output, "deployment.json", dict(format="maniptrans-h2r-deployment-v2", method="maniptrans-mjlab",
+        controller="virtual-wrist-position-v2", prepared_id=metadata["id"], task_id=metadata["task_id"],
+        bundle_id=metadata["bundle_id"], robot_manifest_sha256=metadata["robot_manifest_sha256"],
+        compatibility=metadata["compatibility"], params=saved, dimensions=dimensions, action_dim=env.action_dim,
+        checkpoint="model.pth", control=CONTROL, residual_mean=True, recipe=recipe,
+        bases={s: m["id"] for s, m in manifests.items()}))
+    print(f"Residual deployment: {output}")

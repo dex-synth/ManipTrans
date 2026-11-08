@@ -11,6 +11,10 @@ class PositionControl:
         self.previous = torch.zeros(count, len(robot["joint_names"]), device=device)
         self.wrist_scale = torch.tensor([config["wrist_translation_m"]]*3 + [config["wrist_rotation_rad"]]*3, device=device)
         self.alpha = config["moving_average"]
+        self.limits = config.get("schema") == "virtual-wrist-position-v2"
+        if self.limits:
+            self.ctrl_lower = torch.tensor(robot["command_lower"], device=device)
+            self.ctrl_upper = torch.tensor(robot["command_upper"], device=device)
         if not 0 < self.alpha <= 1 or torch.any(self.wrist_scale <= 0):
             raise ValueError("Invalid position control scales or moving average")
 
@@ -35,6 +39,8 @@ class PositionControl:
             result[:, ids[6:]] = self.lower[ids[6:]] + (finger+1)*0.5*(self.upper[ids[6:]]-self.lower[ids[6:]])
             start += size
         self.previous = self.alpha*result + (1-self.alpha)*self.previous
+        if self.limits:
+            self.previous = torch.maximum(torch.minimum(self.previous, self.ctrl_upper), self.ctrl_lower)
         if not torch.isfinite(self.previous).all():
             raise ValueError("Non-finite position target")
         return self.previous

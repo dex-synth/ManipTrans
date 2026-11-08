@@ -16,7 +16,7 @@ from .protocol import receive, send
 class Controller:
     def __init__(self, deployment, device):
         self.root, self.manifest = load_artifact(deployment, "deployment.json")
-        if self.manifest["format"] != "maniptrans-h2r-deployment-v1":
+        if self.manifest["format"] not in {"maniptrans-h2r-deployment-v1", "maniptrans-h2r-deployment-v2"}:
             raise ValueError("Unsupported deployment format")
         prepared, meta = load_artifact(self.root / "prepared")
         if meta["id"] != self.manifest["prepared_id"]:
@@ -24,6 +24,12 @@ class Controller:
         _, self.task = load_task(prepared / "task")
         self.robot = read_json(prepared / "robot_mapping.json")
         self.reference = Reference(load_arrays(prepared / "reference.npz"), device)
+        self.initial = self.reference.values["robot_q"][0:1]
+        if self.manifest["format"] == "maniptrans-h2r-deployment-v2":
+            initialization = read_json(prepared / "initialization.json")
+            if initialization["joint_names"] != self.robot["joint_names"]:
+                raise ValueError("Initial joint order differs")
+            self.initial = torch.tensor([initialization["robot_q"]], dtype=torch.float32, device=device)
         self.features = Features(self.robot, meta["part_names"],
             sum(v*v for v in read_json(prepared / "task/scene/compiled.json")["base_scene"]["options"]["gravity"])**0.5)
         self.device = device
@@ -45,7 +51,7 @@ class Controller:
         if len(seeds) != len(hello["episodes"]):
             raise ValueError("Duplicate episode identity")
         self.policy = Policy(self.model, self.manifest["action_dim"], seeds, self.device, self.manifest["residual_mean"])
-        initial = self.reference.values["robot_q"][0:1]
+        initial = self.initial
         for identity in seeds:
             control = PositionControl(self.robot, 1, self.device, self.manifest["control"])
             control.reset([0], initial)

@@ -23,6 +23,10 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(4)
     deployment = Path(args.deployment)
+    if read_json(deployment / "deployment.json")["format"] == "maniptrans-h2r-deployment-v2":
+        from .check_v2 import check
+        check(args)
+        return
     client = Controller(deployment, args.device)
     env = MJWarpEnv(deployment / "prepared", "residual", client.robot["sides"], 2, args.device, client.manifest["control"])
     task, robot = env.task, env.robot
