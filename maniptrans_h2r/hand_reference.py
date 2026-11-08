@@ -31,12 +31,8 @@ def velocities(points, quat, times):
     return linear, angular
 
 
-def continuous_euler(rotations, lower, upper, previous=None):
-    """Lift SO(3) before applying limits; never wrap a joint to escape a limit.
-
-    Whole clips may choose a different *constant* equivalent branch. A supplied
-    previous pose instead anchors RSI locally: illegal noise must be resampled.
-    """
+def lift_euler(rotations, previous=None):
+    """Lift SO(3) continuously without using joint limits to wrap a path."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         eulers = Rotation.from_matrix(rotations).as_euler("XYZ")
@@ -53,22 +49,65 @@ def continuous_euler(rotations, lower, upper, previous=None):
         if not np.allclose(Rotation.from_euler("XYZ", last).as_matrix(), matrix, atol=1e-5):
             raise ValueError("Wrist Euler inverse failed FK check")
         result.append(last.copy())
-    result = np.asarray(result)
+    return np.asarray(result)
+
+
+def bounded_euler(path, lower, upper):
+    """Choose one constant equivalent branch/turn offset, or return None."""
+    legal = []
+    for candidate in (path, path*np.array([1, -1, 1])+np.pi):
+        lo = np.ceil((np.asarray(lower)-candidate.min(axis=0)-1e-8)/(2*np.pi))
+        hi = np.floor((np.asarray(upper)-candidate.max(axis=0)+1e-8)/(2*np.pi))
+        if np.all(lo <= hi):
+            shift = np.clip(np.rint(-candidate[0]/(2*np.pi)), lo, hi)
+            legal.append(candidate+2*np.pi*shift)
+    return min(legal, key=lambda q: np.linalg.norm(q[0])) if legal else None
+
+
+def continuous_euler(rotations, lower, upper, previous=None):
+    """Fit a complete path, or anchor RSI to its existing window branch."""
+    result = lift_euler(rotations, previous)
     if previous is None:
-        alternate = result*np.array([1, -1, 1])+np.pi
-        legal = []
-        for path in (result, alternate):
-            lo = np.ceil((np.asarray(lower)-path.min(axis=0)-1e-8)/(2*np.pi))
-            hi = np.floor((np.asarray(upper)-path.max(axis=0)+1e-8)/(2*np.pi))
-            if np.all(lo <= hi):
-                shift = np.clip(np.rint((anchor-path[0])/(2*np.pi)), lo, hi)
-                legal.append(path+2*np.pi*shift)
-        if not legal:
+        result = bounded_euler(result, lower, upper)
+        if result is None:
             raise ValueError("robot_reference_invalid: no legal continuous wrist rotation branch")
-        result = min(legal, key=lambda path: np.linalg.norm(path[0]-anchor))
     if np.any(result < np.asarray(lower)-1e-7) or np.any(result > np.asarray(upper)+1e-7):
         raise ValueError("robot_reference_invalid: anchored wrist rotation branch outside limits")
     return result
+
+
+def wrist_windows(path, lower, upper, max_samples=2000):
+    """Cover every transition once; branch changes occur only between episodes.
+
+    Feasibility of a prefix is monotone, so binary search finds its longest
+    legal end. A short final window is balanced when both resulting paths fit.
+    Short windows forced by limits are retained, never discarded or padded.
+    """
+    if len(path) < 2 or max_samples < 2:
+        raise ValueError("A wrist window needs at least one transition")
+    def fit(a, b):
+        return bounded_euler(path[a:b], lower, upper)
+    spans, start = [], 0
+    while start < len(path)-1:
+        low, high = start+2, min(start+max_samples, len(path))
+        if fit(start, low) is None:
+            raise ValueError(f"robot_reference_invalid: wrist transition {start}:{low} cannot fit limits")
+        while low < high:
+            middle = (low+high+1)//2
+            if fit(start, middle) is None:
+                high = middle-1
+            else:
+                low = middle
+        spans.append((start, low))
+        start = low-1
+    if len(spans) > 1 and spans[-1][1]-spans[-1][0] < 31:
+        a, b = spans[-2][0], spans[-1][1]
+        candidates = range(max(a+30, b-max_samples), min(b-30, a+max_samples))
+        for boundary in sorted(candidates, key=lambda i: abs(2*i-a-b+1)):
+            if fit(a, boundary+1) is not None and fit(boundary, b) is not None:
+                spans[-2:] = [(a, boundary+1), (boundary, b)]
+                break
+    return [(a, fit(a, b)) for a, b in spans]
 
 
 class WristReference:
@@ -97,7 +136,7 @@ class WristReference:
             raise ValueError("Unsupported wrist offset from rotational joint origin")
 
     def solve(self, positions, rotations, previous=None):
-        translation = np.linalg.solve(self.translation_axes, (positions-self.origin).T).T
+        translation = self.translation(positions)
         relative = self.parent_rotation.T @ rotations @ self.local_rotation.T
         angles = continuous_euler(relative, self.lower[3:], self.upper[3:], previous)
         result = np.concatenate([translation, angles], axis=1)
@@ -105,14 +144,23 @@ class WristReference:
             raise ValueError("robot_reference_invalid: wrist outside sealed workspace")
         return result
 
-    def from_points(self, human):
+    def translation(self, positions):
+        q = np.linalg.solve(self.translation_axes, (positions-self.origin).T).T
+        if np.any(q < self.lower[:3]-1e-7) or np.any(q > self.upper[:3]+1e-7):
+            raise ValueError("robot_reference_invalid: wrist outside sealed workspace")
+        return q
+
+    def rotations_from_points(self, human):
         palm = [5, 9, 13, 17]
         source = self.template[palm]-self.template[:1]
         desired = human[:, palm]-human[:, :1]
         u, _, vt = np.linalg.svd(np.einsum("ni,tnj->tij", source, desired))
         correction = np.broadcast_to(np.eye(3), (len(human), 3, 3)).copy()
         correction[:, 2, 2] = np.linalg.det(vt.swapaxes(-1, -2)@u.swapaxes(-1, -2))
-        rotation = vt.swapaxes(-1, -2)@correction@u.swapaxes(-1, -2)@self.zero_rotation
+        return vt.swapaxes(-1, -2)@correction@u.swapaxes(-1, -2)@self.zero_rotation
+
+    def from_points(self, human):
+        rotation = self.rotations_from_points(human)
         q = self.solve(human[:, 0], rotation)
         return q, quaternion_signs(Rotation.from_matrix(rotation).as_quat(scalar_first=True))
 
@@ -138,6 +186,24 @@ def reference_from_points(model, robot, side, points, times):
     human = np.asarray(points)[:, MANO_ORDER]
     wrist = WristReference(model, robot, side)
     q, quat = wrist.from_points(human)
+    return reference_values(human, q, quat, times, side)
+
+
+def pretraining_reference(model, robot, side, points, times):
+    """Compute physical targets/derivatives once, then fit per-episode angles."""
+    human = np.asarray(points)[:, MANO_ORDER]
+    wrist = WristReference(model, robot, side)
+    rotations = wrist.rotations_from_points(human)
+    angles = lift_euler(wrist.parent_rotation.T @ rotations @ wrist.local_rotation.T)
+    segments = wrist_windows(angles, wrist.lower[3:], wrist.upper[3:])
+    q = np.concatenate([wrist.translation(human[:, 0]), angles], axis=1)
+    quat = quaternion_signs(Rotation.from_matrix(rotations).as_quat(scalar_first=True))
+    # Unbounded angles are replaced by each segment's legal angles before
+    # storage. World targets and velocities retain their whole-clip values.
+    return reference_values(human, q, quat, times, side), segments
+
+
+def reference_values(human, q, quat, times, side):
     linear, angular = velocities(human[:, 0], quat, times)
     return {f"{side}_human": human.astype(np.float32),
             f"{side}_human_velocity": gaussian_filter1d(np.gradient(human, times, axis=0), 2, axis=0, mode="nearest").astype(np.float32),

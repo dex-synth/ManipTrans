@@ -43,7 +43,9 @@ H2R 明确预算为默认 10000 epochs、4096 worlds；沿用原生 horizon 32�
 
 Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实时间导数、连续腕 Euler 分支及 Jacobian 速度换算在方法侧处理；阶段 1 不做手指 IK。原生奖励与阈值课程保持，课程按控制调用计数，终止保留窗口最后一帧。
 
-腕旋转先不加限位地连续展开，再为整段选择合法的固定等价分支及 `2π` 偏移；不能在撞限位的帧换分支。整段无可行连续表示则记录 `robot_reference_invalid`，默认停止准备，显式 partial 模式才跳过。RSI 以抽中帧的参考腕角锚定分支；噪声越界时重采，不跳转到另一圈。
+阶段 1 的 `windowing=wrist-feasible-v1` 先在完整连续片段上计算世界姿态、速度和无界腕角，再按限位选择至多2000样本的最长合法窗口。每窗只选择固定等价分支及 `2π` 偏移，不在 episode 内换圈；新分支只在窗口 reset 时生效。全部源转移恰好覆盖一次，世界姿态、速度和时间不因切窗重算。相邻窗口保存各自的边界样本与腕角，用 `source_sample_start` 保留源索引。短末窗在可行时均分，限位强制的短窗保留并计入 `short_window_count`。池内仍按真实转移时长加权。单个转移无法表示或腕平移越界仍报 `robot_reference_invalid`，不删帧或扩大共同限位。
+
+阶段 2 仍为完整任务选择连续腕角，不使用预训练窗口重置任务时钟。RSI 以抽中帧的参考腕角锚定分支；噪声越界时重采，不跳转到另一圈。
 
 部分 corpus 必须显式使用 `--allow-incomplete`。功能检查可加 `--small-network --worlds 8 --epochs 2 --diagnostic-every 0`；即使跳过中间诊断，最终仍做均值和 RSI 随机策略诊断。小网络或部分数据产物标记 `smoke=true`，不能用于默认正式 residual 入口。
 
@@ -130,6 +132,6 @@ Bench 按同一 task/spec 启动 `evaluate-server` 后连接：
 
 旧版显式使用 `prepare --legacy-v1` 与 `train --train-local-imitators`；旧 `virtual-wrist-position-v1` deployment 仍可评估，保留其平滑和时钟。v1 的完整场景 imitator／逐示范训练不作为通用预训练。原生 wrench checkpoint 与两个位置控制版本都不兼容。
 
-当前准备采用 `hand-reference-v3` 和 `maniptrans-hand-physics-v2` 签名。签名包括关节限位／摩擦求解参数、执行器及几何物理、具名 mesh 对应、CCD 和其他封存物理 options；暂未覆盖的手部 tendon、equality 或显式 contact pair 会明确拒绝，物体内部约束可保留。不满足上述签名的旧单手参考须重新 prepare。训练采用 `training_revision=4`，residual 准备采用 `preparation_revision=3`。两阶段均需以新 failure clock 重训；原有满足签名且未改变语义的单手参考可复用。旧 base、旧 residual prepared 和旧 resume 不得作为本配方继续训练。旧封存 deployment 仍可按其原控制契约评估。
+当前物理／特征签名仍为 `hand-reference-v3` 和 `maniptrans-hand-physics-v2`，包括具名几何、关节、执行器和封存物理 options；未覆盖的手部 tendon、equality 或显式 contact pair 明确拒绝。阶段 1 prepared 采用 `preparation_revision=2`、`windowing=wrist-feasible-v1`，旧单手参考需重新 prepare。训练采用 `training_revision=5`，两侧 base 需重训，旧 resume 不跨版本续接。阶段 2 的完整任务参考语义未变，满足当前签名和 `preparation_revision=3` 的 residual prepared 可复用。旧封存 deployment 仍可按其原控制契约评估。
 
 本轮短 PPO、真实接触对照与共同评估记录在 bench `runs/checks/maniptrans-native-alignment-20261108/`。短跑不代表全集覆盖、完整预算收敛或论文成绩；其他机器人与未实际运行的批次组合不据此宣称已验证。

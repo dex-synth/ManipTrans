@@ -8,7 +8,7 @@ import torch
 from .hand_reference import WristReference
 from .io import load_artifact, read_json, sha256
 from .mjlab_env import MjlabVecEnv, hand_model
-from .motion import MotionCache
+from .motion import MotionCache, WINDOW_SCHEMA
 from .residual_reward import hand_reward
 from .robot_physics import require_compatibility
 
@@ -20,6 +20,8 @@ class ImitatorEnv(MjlabVecEnv):
             raise ValueError("Expected generalist pretraining reference")
         if metadata["partial"] and not allow_partial:
             raise ValueError("Partial corpus requires --allow-incomplete")
+        if metadata.get("recipe", {}).get("windowing") != WINDOW_SCHEMA:
+            raise ValueError("Re-prepare the corpus with wrist-feasible training windows")
         require_compatibility(metadata["compatibility"])
         robot = read_json(self.path / "robot_mapping.json")
         self.side = robot["sides"][0]

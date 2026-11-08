@@ -19,6 +19,7 @@ from lib.rl.numerics import enable_checks, require_finite
 from .io import digest, load_artifact, read_json, seal, sha256, write_json
 from .policy import parameters, register
 
+TRAINING_REVISION = 5
 
 def training_arguments(parser, stage):
     defaults = yaml.safe_load((Path(__file__).parent / "config" / f"{stage}.yaml").read_text())
@@ -153,7 +154,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
     for key in ("worlds", "epochs", "horizon", "mini_epochs", "seed", "save_every", "diagnostic_every"):
         recipe[key] = getattr(args, key)
     recipe.update(small_network=args.small_network, partial=prepared_meta.get("partial", False),
-                  training_framework="mjlab", physics_engine="mujoco_warp", training_revision=4, base_sampling="native-resample",
+                  training_framework="mjlab", physics_engine="mujoco_warp", training_revision=TRAINING_REVISION, base_sampling="native-resample",
                   native_config_source="main/cfg/config.yaml + task and rl_train stage defaults",
                   budget_source="H2R explicit limits")
     batch = args.worlds*args.horizon
@@ -256,8 +257,8 @@ def train_residual(args):
         root, manifest = load_artifact(path, "imitator.json")
         if manifest["format"] != "maniptrans-h2r-imitator-v1" or manifest["side"] != side:
             raise ValueError("Wrong imitator format or hand side")
-        if manifest.get("recipe", {}).get("training_revision") != 4:
-            raise ValueError("Retrain the base with the aligned failure clock (training revision 4)")
+        if manifest.get("recipe", {}).get("training_revision") != TRAINING_REVISION:
+            raise ValueError("Retrain the base with wrist-feasible windows and the current training revision")
         if manifest["smoke"] and not args.allow_smoke_imitator:
             raise ValueError("Smoke base requires --allow-smoke-imitator")
         if manifest["compatibility"] != metadata["compatibility"][side] or manifest["control"] != CONTROL:

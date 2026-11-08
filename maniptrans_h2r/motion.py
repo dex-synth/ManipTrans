@@ -6,23 +6,7 @@ import torch
 
 DATASETS = ("arctic", "oakink2", "hot3d", "taco")
 WIDTH = 63+63+13+6
-
-
-def windows(count, max_samples=2000):
-    """Nonoverlapping transitions, shared boundary samples, balanced short tail."""
-    lengths = []
-    remaining = count-1
-    while remaining:
-        n = min(remaining, max_samples-1)
-        lengths.append(n)
-        remaining -= n
-    if len(lengths) > 1 and lengths[-1] < 30:
-        total = lengths[-2]+lengths[-1]
-        lengths[-2:] = [total//2, total-total//2]
-    offset = 0
-    for length in lengths:
-        yield offset, length+1
-        offset += length
+WINDOW_SCHEMA = "wrist-feasible-v1"
 
 
 def pack(reference, side):

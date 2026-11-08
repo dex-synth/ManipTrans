@@ -7,21 +7,12 @@ import torch
 
 from lib.rl.rewards import manipulation_reward
 from maniptrans_h2r.hand_reference import continuous_euler, quaternion_signs
-from maniptrans_h2r.motion import MotionCache, pack, windows
+from maniptrans_h2r.motion import MotionCache, pack
 from maniptrans_h2r.policy import build, parameters
 from maniptrans_h2r.residual_reward import hand_inputs, native_call, residual_reward
 from maniptrans_h2r.robot_physics import require_clock
 from maniptrans_h2r.rsi import sampling_probabilities
 from maniptrans_h2r.control import PositionControl
-
-
-def test_windows_preserve_every_transition_and_balance_short_tail():
-    for count in (31, 2000, 2001, 4000, 4020, 10003):
-        parts = list(windows(count))
-        covered = [i for start, length in parts for i in range(start, start+length-1)]
-        assert covered == list(range(count-1))
-        assert max(length for _, length in parts) <= 2000
-        assert all(length >= 31 for _, length in parts)
 
 
 def test_euler_branches_are_continuous_through_wrap_and_gimbal():

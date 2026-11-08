@@ -8,9 +8,9 @@ import shutil
 
 import numpy as np
 
-from .hand_reference import interpolate_motion, reference_from_points
+from .hand_reference import interpolate_motion, pretraining_reference
 from .io import check_files, digest, load_arrays, load_artifact, load_task, read_json, seal, sha256, write_json
-from .motion import WIDTH, pack, windows
+from .motion import WIDTH, WINDOW_SCHEMA, pack
 from .robot import command_limits, mapping
 from .robot_physics import extract_hand
 
@@ -61,7 +61,7 @@ def prepare(args):
                 try:
                     points = interpolate_motion(arrays, clip, times, args.mano_root,
                                                 endpoints=endpoints, mirror=clip["source_side"] != args.side)
-                    reference = reference_from_points(model, robot, args.side, points, times)
+                    reference, segments = pretraining_reference(model, robot, args.side, points, times)
                     values = pack(reference, args.side)
                 except ValueError as exc:
                     errors.append(dict(clip_id=clip["id"], dataset=clip["dataset"], source_interval=clip["source_interval"],
@@ -70,12 +70,15 @@ def prepare(args):
                         write_json(output / "reference_errors.json", errors)
                         raise
                     continue
-                stream.write(values.tobytes())
-                for start, count in windows(len(times)):
-                    records.append(dict(offset=offset+start, length=count, dataset=clip["dataset"],
+                for start, angles in segments:
+                    count = len(angles)
+                    chunk = values[start:start+count].copy()
+                    chunk[:, -3:] = angles
+                    stream.write(chunk.tobytes())
+                    records.append(dict(offset=offset, length=count, source_sample_start=start, dataset=clip["dataset"],
                         source_side=clip["source_side"], synthetic=synthetic, clip_id=clip["id"],
                         recording=clip["recording"], endpoints=endpoints, unused_tail_s=length-times[-1]))
-                offset += len(times)
+                    offset += count
             print(f"Prepared {clip['dataset']}/{clip['id'][:12]}: {offset} samples", flush=True)
     if not offset:
         raise ValueError("No valid robot hand references")
@@ -88,7 +91,8 @@ def prepare(args):
     raw.unlink()
     write_json(output / "reference_errors.json", errors)
     write_json(output / "motion_manifest.json", dict(windows=records, synthetic_fraction=args.synthetic_fraction,
-        seed=args.seed, corpus_id=meta["id"], augmentation="interpolated_mano_v1", samples=offset))
+        seed=args.seed, corpus_id=meta["id"], augmentation="interpolated_mano_v1", samples=offset,
+        windowing=WINDOW_SCHEMA, short_window_count=sum(r["length"] < 31 for r in records)))
     diagnostic = []
     for dataset in ("arctic", "oakink2", "hot3d", "taco"):
         for side in ("left", "right"):
@@ -100,7 +104,9 @@ def prepare(args):
     result = seal(output, "prepared.json", dict(format="maniptrans-h2r-pretrain-v1", side=args.side,
         corpus_id=meta["id"], partial=bool(not meta["inventory_complete"] or errors),
         compatibility=compatibility, control_dt_s=1/60, physics_dt_s=1/120, source_task_id=task["task_id"],
-        recipe=dict(seed=args.seed, synthetic_fraction=args.synthetic_fraction, augmentation="interpolated_mano_v1")))
+        preparation_revision=2,
+        recipe=dict(seed=args.seed, synthetic_fraction=args.synthetic_fraction, augmentation="interpolated_mano_v1",
+                    windowing=WINDOW_SCHEMA)))
     print(f"Prepared generalist reference: {result['id']}")
     return output
 
