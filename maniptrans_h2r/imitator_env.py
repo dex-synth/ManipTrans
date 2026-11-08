@@ -84,7 +84,7 @@ class ImitatorEnv(MjlabVecEnv):
         self.views["time"][ids] = self.tick[ids].float()/120
 
     def reward(self, state, target, power, actions):
-        return hand_reward(self.robot, self.side, state, target, power, actions, self.elapsed_ticks, self.scale)
+        return hand_reward(self.robot, self.side, state, target, power, actions, self.completed_controls, self.scale)
 
     def sampler_state(self):
         return dict(motion=self.motion.state_dict(), rsi=self.rng.bit_generator.state)

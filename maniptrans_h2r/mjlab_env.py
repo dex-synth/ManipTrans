@@ -90,6 +90,8 @@ class MjlabVecEnv:
         self.features = Features(robot, metadata.get("part_names", []), float(np.linalg.norm(model.opt.gravity)))
         self.tick = torch.zeros(count, dtype=torch.long, device=device)
         self.elapsed_ticks = torch.zeros_like(self.tick)
+        self.completed_controls = torch.zeros_like(self.tick)
+        self.curriculum = None
         self.done = torch.ones(count, dtype=torch.bool, device=device)
         self.success_buf = torch.zeros(count, device=device)
         self.failure_buf = torch.zeros_like(self.success_buf)
@@ -152,6 +154,8 @@ class MjlabVecEnv:
         if len(ids):
             unaffected = ~self.done
             saved = {k: v[unaffected].clone() for k, v in self.views.items()}
+            if self.curriculum is not None:
+                self.curriculum.reset(ids.cpu().numpy(), self.common_steps)
             self.sim.reset(ids)
             self.reset_states(ids)
             self.views["ctrl"][ids[:, None], torch.as_tensor(self.robot["actuator_indices"], device=self.device)] = self.views["qpos"][ids][:, self.robot["qpos_indices"]][:, self.robot["ctrl_joint_indices"]]
@@ -166,6 +170,7 @@ class MjlabVecEnv:
                 self.contact_history[s][ids] = True
             self.control.reset(ids, self.views["qpos"][ids][:, self.robot["qpos_indices"]])
             self.elapsed_ticks[ids] = 0
+            self.completed_controls[ids] = 0
             self.done[ids] = False
         return self.observe(), ids
 
@@ -196,11 +201,14 @@ class MjlabVecEnv:
         self.elapsed_ticks += steps
         self.advance_reference()
         self.common_steps += 1
+        if self.curriculum is not None:
+            self.curriculum.advance()
         for s in self.sides:
             self.contact_history[s] = torch.cat([self.contact_history[s][:, 1:], (self.tip_force[s].norm(dim=-1)>0)[:, None]], dim=1)
         state = self.state()
         self.last_power = power
         reward, failure, details = self.reward(state, self.target(0), power, actions)
+        self.completed_controls += 1
         if any(not torch.isfinite(self.views[k]).all() for k in ("qpos", "qvel")) or not torch.isfinite(reward).all():
             raise RuntimeError("Non-finite physical state or native reward")
         at_end = self.remaining_ticks() == 0

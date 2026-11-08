@@ -22,6 +22,9 @@ class Controller:
         if meta["id"] != self.manifest["prepared_id"]:
             raise ValueError("Deployment reference binding differs")
         _, self.task = load_task(prepared / "task")
+        if self.manifest.get("recipe", {}).get("training_revision", 0) >= 4:
+            from .robot_physics import require_contacts
+            require_contacts(self.task)
         self.robot = read_json(prepared / "robot_mapping.json")
         self.reference = Reference(load_arrays(prepared / "reference.npz"), device)
         self.initial = self.reference.values["robot_q"][0:1]

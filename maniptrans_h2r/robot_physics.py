@@ -56,6 +56,13 @@ def require_clock(task):
         raise ValueError("v2 requires a new sealed task with --physics-hz 120 --control-hz 60")
 
 
+def require_contacts(task):
+    observation = task["observation"]
+    if (not observation.get("contacts") or observation.get("contact_schema") != "h2r-body-contacts-v1"
+            or observation.get("contact_coverage") != "robot-all-v1"):
+        raise ValueError("Native-aligned training requires a new task with robot-all-v1 contact coverage")
+
+
 def hand_ids(model, robot, side):
     root = int(model.joint(robot["hands"][side]["joints"][0]).bodyid[0])
     descendants = {root}

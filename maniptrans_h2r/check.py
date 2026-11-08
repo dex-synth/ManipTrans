@@ -18,6 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deployment", required=True)
     parser.add_argument("--run", help="Optional nominal bench physical rollout to replay for one control interval")
+    parser.add_argument("--contact-probe", help="Bench-generated same-state contact observations for v2 parity")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()

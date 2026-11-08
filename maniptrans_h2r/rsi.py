@@ -1,5 +1,6 @@
 """Weighted robot IK and validated full-scene reference-state initialization."""
 
+import time
 import xml.etree.ElementTree as ET
 
 import mujoco
@@ -45,30 +46,61 @@ def fit(task_path, task, robot, arrays, initial, iterations, device):
     upper = torch.tensor(robot["upper"], device=device)
     weights = torch.tensor(FIT_WEIGHTS*len(robot["sides"]), device=device)
     human = np.concatenate([arrays[f"{s}_human"] for s in robot["sides"]], axis=1)
-    result = []
-    for start in range(0, len(initial), 256):
-        q0 = torch.tensor(initial[start:start+256], dtype=torch.float32, device=device)
-        wrist = torch.nn.Parameter(q0[:, wrist_ids].clone())
-        fingers = torch.nn.Parameter(q0[:, finger_ids].clone())
-        optimizer = torch.optim.Adam([dict(params=[wrist], lr=.0008), dict(params=[fingers], lr=.0004)])
-        target = torch.tensor(human[start:start+256], dtype=torch.float32, device=device)
-        for step in range(iterations):
-            q = q0.clone()
-            q[:, wrist_ids], q[:, finger_ids] = wrist, fingers
-            transforms = chain.forward_kinematics(q[:, order])
-            points = torch.stack([transforms[b].get_matrix()[:, :3, 3] for b in bodies], 1)
-            loss = ((points-target).norm(dim=-1)*weights).mean()
-            optimizer.zero_grad()
+    if iterations < 1:
+        raise ValueError("IK iterations must be positive")
+    started = time.monotonic()
+    q0 = torch.tensor(initial, dtype=torch.float32, device=device)
+    wrist = torch.nn.Parameter(q0[:, wrist_ids].clone())
+    fingers = torch.nn.Parameter(q0[:, finger_ids].clone())
+    optimizer = torch.optim.Adam([dict(params=[wrist], lr=.0008), dict(params=[fingers], lr=.0004)])
+    target = torch.tensor(human, dtype=torch.float32, device=device)
+
+    def chunk_loss(start, stop):
+        q = q0[start:stop].clone()
+        q[:, wrist_ids], q[:, finger_ids] = wrist[start:stop], fingers[start:stop]
+        transforms = chain.forward_kinematics(q[:, order])
+        points = torch.stack([transforms[b].get_matrix()[:, :3, 3] for b in bodies], 1)
+        return ((points-target[start:stop]).norm(dim=-1)*weights).sum() / (len(q0)*len(bodies))
+
+    stats = optimize_sequence(optimizer, chunk_loss, len(q0), iterations,
+        lambda: (wrist.clamp_(lower[wrist_ids], upper[wrist_ids]),
+                 fingers.clamp_(lower[finger_ids], upper[finger_ids])))
+    q0[:, wrist_ids], q0[:, finger_ids] = wrist.detach(), fingers.detach()
+    stats["elapsed_s"] = time.monotonic()-started
+    return q0.cpu().numpy(), stats
+
+
+def optimize_sequence(optimizer, chunk_loss, count, iterations, project, chunk_size=256):
+    """One global mean, Adam update and native stop decision per iteration.
+
+    chunk_loss returns its contribution to the full-sequence mean. Only the FK
+    graph is chunked; parameter gradients and Adam state span the whole sequence.
+    Like native fitting, the stop check uses the loss before the returned update.
+    """
+    import torch
+    past_loss, reason = 1e10, "iteration_budget"
+    for step in range(1, iterations+1):
+        optimizer.zero_grad()
+        losses = []
+        for start in range(0, count, chunk_size):
+            loss = chunk_loss(start, min(start+chunk_size, count))
             loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                wrist.clamp_(lower[wrist_ids], upper[wrist_ids])
-                fingers.clamp_(lower[finger_ids], upper[finger_ids])
-            if step % 100 == 0 or step == iterations-1:
-                print(f"IK frames {start}:{start+len(q0)} step {step+1}/{iterations}: {loss.item():.6f}", flush=True)
-        q0[:, wrist_ids], q0[:, finger_ids] = wrist.detach(), fingers.detach()
-        result.append(q0.cpu().numpy())
-    return np.concatenate(result)
+            losses.append(loss.detach())
+        value = float(torch.stack(losses).sum())
+        if not np.isfinite(value):
+            raise FloatingPointError("Non-finite IK loss")
+        optimizer.step()
+        with torch.no_grad():
+            project()
+        if step % 100 == 0:
+            print(f"IK step {step}/{iterations}: {value:.6f}", flush=True)
+            if past_loss-value < 1e-5:
+                reason = "native_loss_improvement"
+                break
+            past_loss = value
+    print(f"IK stopped at {step}: {reason}, loss={value:.6f}", flush=True)
+    return dict(iterations=step, iteration_limit=iterations, stop_reason=reason,
+                loss=value, loss_timing="before_final_update", output_timing="after_final_update")
 
 
 def states(model, task, robot, reference, optimized):

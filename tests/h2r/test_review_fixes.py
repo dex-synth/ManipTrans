@@ -51,6 +51,7 @@ def test_power_uses_post_step_velocity_and_preserves_short_terminal(monkeypatch)
         views=views, robot=dict(actuator_indices=[0], ctrl_joint_indices=[0], qvel_indices=[0]),
         control=SimpleNamespace(decode=lambda *args: torch.zeros(2, 1)), stage='residual', sides=[],
         sim=SimpleNamespace(step=simulate), data=SimpleNamespace(overflow=torch.zeros(2)),
+        curriculum=None, completed_controls=torch.zeros(2, dtype=torch.long),
         tick=torch.zeros(2, dtype=torch.long), elapsed_ticks=torch.zeros(2, dtype=torch.long), common_steps=0,
         scale=.7, contacts=lambda: {}, state=lambda: {}, target=lambda *args: dict(robot_q=torch.zeros(2, 1)),
         advance_reference=lambda: None, features=lambda *args: {},

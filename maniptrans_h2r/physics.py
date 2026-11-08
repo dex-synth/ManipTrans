@@ -92,7 +92,8 @@ def gpu_audit(cpu, gpu, task, scene_hash):
         expected = np.asarray(getattr(cpu, field))
         value = getattr(gpu, field)
         value = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
-        if value.shape == (1, *expected.shape):
+        if value.ndim == expected.ndim+1 and value.shape[1:] == expected.shape:
+            equal(value, np.broadcast_to(expected, value.shape), f"mjwarp.{field}", atol=1e-7)
             value = value[0]
         equal(value, expected, f"mjwarp.{field}", atol=1e-7)
         values[field] = value.tolist()

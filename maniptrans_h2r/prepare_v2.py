@@ -13,7 +13,7 @@ from .hand_reference import WristReference, reference_from_points
 from .io import check_inputs, load_arrays, load_task, read_json, seal, write_json
 from .prepare import body_reference, sample_mesh, velocity
 from .robot import command_limits, mapping
-from .robot_physics import require_clock, signature
+from .robot_physics import require_clock, require_contacts, signature
 from . import rsi
 
 
@@ -28,6 +28,7 @@ def prepare(args):
     torch.set_num_threads(4)
     source, task = load_task(args.task)
     require_clock(task)
+    require_contacts(task)
     if args.bundle or args.robot_bundle:
         if not args.bundle or not args.robot_bundle:
             raise ValueError("Pass both --bundle and --robot-bundle")
@@ -94,13 +95,13 @@ def prepare(args):
         guess[:, hand["indices"][:6]] = np.clip(initial_wrist, wrist.lower, wrist.upper)
     reference["robot_q"] = canonical
     reference["robot_dq"] = velocity(canonical, times)
-    optimized = rsi.fit(source, task, robot, reference, guess, args.iterations, args.device)
+    optimized, ik = rsi.fit(source, task, robot, reference, guess, args.iterations, args.device)
     qpos, qvel = rsi.states(model, task, robot, reference, optimized)
     valid, reasons = rsi.validate(model, task, robot, reference, qpos, surfaces)
     np.savez_compressed(output / "reference.npz", **reference)
     np.savez_compressed(output / "rsi.npz", qpos=qpos, qvel=qvel, valid_start=valid, ticks=ticks)
     write_json(output / "rsi.json", dict(valid_start_count=int(valid.sum()), total_count=len(valid),
-        source_ticks=ticks.tolist(), reasons=reasons, ik_iterations=args.iterations,
+        source_ticks=ticks.tolist(), reasons=reasons, ik=ik, ik_iterations=args.iterations,
         wrist_reference_difference=(optimized[:, [i for s in robot["sides"] for i in robot["hands"][s]["indices"][:6]]]-canonical[:, [i for s in robot["sides"] for i in robot["hands"][s]["indices"][:6]]]).max(axis=0).tolist()))
     for p, vertices in surfaces.items():
         np.save(output / f"surface-{parts.index(p)}.npy", vertices)
@@ -115,6 +116,6 @@ def prepare(args):
         bundle_id=task["bundle_id"], robot_manifest_sha256=task["robot_manifest_sha256"], part_names=parts,
         scoring_parts=scoring, hand_order=robot["sides"], object_root_names=list(task["object"].get("roots", {})),
         object_joint_names=list(task["object"]["joints"]), compatibility=compatibility,
-        control_dt_s=1/60, physics_dt_s=1/120, decimation=2, physics_schedule="nominal", ik_iterations=args.iterations))
+        control_dt_s=1/60, physics_dt_s=1/120, decimation=2, physics_schedule="native-residual-v1", preparation_revision=3, ik=ik))
     print(f"Prepared {metadata['id']}; valid RSI starts {valid.sum()}/{len(valid)}; initial collision {'failed' if collisions else 'passed'}")
     return output

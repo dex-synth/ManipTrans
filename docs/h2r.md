@@ -39,7 +39,7 @@ for side in right left; do
  done
 ```
 
-默认 10000 epochs、horizon 32、minibatch 1024、mini-epochs 5、seed 42。配置集中在 `config/imitator.yaml`。四数据集等概率、源左右侧等概率，90% 真实／10% MANO 旋转 SLERP 合成；异侧源镜像到目标手。真实序列全长切成至多 2000 帧且共享边界的窗口，按有效秒数抽样，CPU mmap 与每环境 GPU cache 按需取数，不预先把全集搬上显卡。
+H2R 明确预算为默认 10000 epochs、4096 worlds；沿用原生 horizon 32、minibatch 1024、mini-epochs 5、seed 42。选定入口为 `main/cfg/config.yaml` 加各阶段 task／rl_train 默认，learning_rate=5e-4、moving_average=1；不混用 README 的 .4/2e-4 override。原生 score_to_win=10000、early_stop_epochs=9999999999999、save_best_after=10（imitator）／2（residual）保留，有限 epoch 预算单独记录停止原因。配置集中在 `config/imitator.yaml`。四数据集等概率、源左右侧等概率，90% 真实／10% MANO 旋转 SLERP 合成；异侧源镜像到目标手。真实序列全长切成至多 2000 帧且共享边界的窗口，按有效秒数抽样，CPU mmap 与每环境 GPU cache 按需取数，不预先把全集搬上显卡。
 
 Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实时间导数、连续腕 Euler 分支及 Jacobian 速度换算在方法侧处理；阶段 1 不做手指 IK。原生奖励与阈值课程保持，课程按控制调用计数，终止保留窗口最后一帧。
 
@@ -66,9 +66,11 @@ Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实
 
 每手主要部件按人手指尖与计分物体的中位距离确定，也可用 `--object right=PART --object left=PART` 显式指定。主要部件只决定特征绑定，**全部 scoring parts 均参与 reward 和 failure**；物体项总权重为手数。动态上下文、自由根、hinge、spring 和固定支撑均保留在单个完整场景中。
 
-4000 步 weighted-keypoint IK 为 RSI 生成候选，腕／手指 Adam 学习率分别为 .0008/.0004。全部 roots、hinges、双手在相同源 tick 初始化；碰撞、限位和接触候选检查失败会记录，合法起帧为空则拒绝训练。评估始终提交优化后的第 0 帧机器人姿态，速度由 bench 置零，不从 RSI 选择最好起帧。
+weighted-keypoint IK 默认以 4000 次为上限，为 RSI 生成候选，腕／手指 Adam 学习率分别为 .0008/.0004。每 100 次检查完整序列平均加权 loss，改善小于 1e-5 则按原生条件停止；256 帧分块仅限制 FK 图内存，不分块决定停止，也不改变全序列 loss 归一化。`rsi.json` 记录实际迭代数、停止原因、更新前 loss、更新后输出及耗时。全部 roots、hinges、双手在相同源 tick 初始化；碰撞、限位和接触候选检查失败会记录，合法起帧为空则拒绝训练。评估始终提交优化后的第 0 帧机器人姿态，速度由 bench 置零，不从 RSI 选择最好起帧。
 
-`config/residual.yaml` 默认 4096 环境、10000 epochs、32/1024/5 PPO 配方；残差 init gain=.01、logstd=-1，保留原生 warmup 调用顺序。全部 base 参数和 normalizer buffers 冻结并在保存时核验；PPO 重算使用 rollout 时保存的 base 样本。物体质量、重力、接触、弹簧和 servo gains 在整个课程中保持 task 名义值。
+`config/residual.yaml` 默认 4096 环境、10000 epochs、32/1024/5 PPO 配方；残差 init gain=.01、logstd=-1，保留原生 warmup 调用顺序。全部 base 参数和 normalizer buffers 冻结并在保存时核验；PPO 每次 minibatch forward 按原生行为重新采样 base，不传入 rollout 时的固定 base 样本；部署的每 episode RNG 隔离仍保留。
+
+Residual 私有训练恢复 `ResDexHand.yaml` 的原生物理课程：重力从 0 倍、物体滑动摩擦从 3 倍起，在 1920 个控制步（32 秒）内 linear decay。更新只在 reset 调用时检查：全局间隔至少 32 步，逐 world age 达到 32 且正在 reset 才更新摩擦；首次全部应用。保留 native age 消耗顺序及绝对摩擦 [1, 6) 的 250 桶量化，终点不保证等于未量化名义值。所有交互物体部件及后代 geoms 都覆盖，机器人／环境摩擦、扭转／滚动摩擦、质量、弹簧和 servo gains 保持名义值。mjlab 扩展 per-world friction 并重建 CUDA graph；随后原位写入 GPU，weight 特征使用当前训练重力。保存并回读审计课程状态；恢复时还原各 world 摩擦历史、age 和全局门限，再按重新 reset worlds 的原生调度继续。
 
 阶段 2 默认在 epoch 0、每 100 epochs 和最终 epoch 执行 `full-task tracking diagnostic`，写入 `diagnostics/epoch-N.json`。独立 nominal world 使用固定首帧机器人姿态、task 物体初态、零速度、seed 43、随机 base／residual 均值和严格 scale=.7；从头运行至原生失败或真实末端，记录有效前缀覆盖、终止 tick 及各计分部件误差。首帧碰撞不通过则明确记录初始化失败。这些诊断不更新 normalizer、训练 RNG、训练 world 或课程，也不是 bench SR。`--diagnostic-every 0` 可关闭中间诊断，最终诊断仍执行。
 
@@ -85,7 +87,7 @@ finger = lower + (clamp(base + 2 * residual, -1, 1) + 1) / 2 * (upper - lower)
 
 接触／约束缓冲容量分别在两份 YAML 中固定：单手 128/1024，完整场景 512/2048。容量不足明确报错，不截断接触或自动减少环境数。
 
-每个控制区间只采样／解码一次动作，调用两次 `Simulation.step()`；任务末端剩一个 physics tick 时仅执行一次。功率使用实际最后一次 solve 的执行力乘该物理步积分后的速度，与原生 reward 和训练计划一致；提前到末端的 world 保留自身最后一步的功率。积分后仅刷新运动学，避免额外 full forward 覆盖接触求解结果。每指接触 sensor 精确匹配该 body 的碰撞 geoms，包含全部接触伙伴；在线状态使用 bench 真实 contact records。
+episode 的 `completed_controls` 独立于物理 tick／参考 tick，reward 使用当前调用之前的计数：residual 第 8/9 次传 7/8，imitator 第 20/21 次传 19/20；reward 后递增，部分 reset 仅清对应 world。每个控制区间只采样／解码一次动作，调用两次 `Simulation.step()`；任务末端剩一个 physics tick 时仅执行一次。功率使用实际最后一次 solve 的执行力乘该物理步积分后的速度，与原生 reward 和训练计划一致；提前到末端的 world 保留自身最后一步的功率。积分后仅刷新运动学，避免额外 full forward 覆盖接触求解结果。每指接触 sensor 精确匹配该 body 的碰撞 geoms，包含全部接触伙伴；在线状态使用 bench 真实 contact records。新配方要求 `contact_coverage=robot-all-v1`，包含手内与双手接触；schema 相同但覆盖缺失的旧 task 不能用于新训练。
 
 训练核验封存 CPU 模型、sensor 模型和 GPU 实际参数，显式恢复 MJWarp 的 solver tolerance。Bench MJWarp runtime 可能保留 float32 的 `1e-6` 下限；相同物理参数不意味着长轨迹逐位等价。
 
@@ -97,7 +99,7 @@ finger = lower + (clamp(base + 2 * residual, -1, 1) + 1) / 2 * (upper - lower)
 | `deployment.json` | 任务身份、相对路径 base、residual checkpoint、动作与特征契约 |
 | `model.pth` | 仅模型 tensor，供部署加载 |
 | `resume.pth` | 可信本地模型／优化器／normalizer／scheduler／RNG／sampler／课程状态 |
-| `resolved_config.yaml`, `source.json`, `training.json` | 实际配方、源码 hash、依赖／GPU 版本与训练步数 |
+| `resolved_config.yaml`, `ppo_config.json`, `source.json`, `training.json` | 实际配方、源码 hash、依赖／GPU 版本与训练步数 |
 
 输出目录必须不存在。续训传 `--resume /old/output/resume.pth --output /new/output --epochs TOTAL`，其余影响学习的参数与输入身份保持一致。只在完整 PPO epoch 边界恢复，重新 reset 训练 worlds，记录 `world_state_restarted=true`，不承诺与不中断运行逐位一致。
 
@@ -124,10 +126,10 @@ Bench 按同一 task/spec 启动 `evaluate-server` 后连接：
   --deployment /path/to/deployment --output /path/to/check.json --device cuda:0
 ```
 
-`check` 按部署版本选择诊断：v2 检查 train/client 特征与动作、masked reset、60 次控制推进 120 ticks、末端单 tick、名义物理不变；`--run` 可增加同任务名义 bench 首区间对照。单元测试包含窗口覆盖、腕分支、采样质量、全物体 reward 和条件 base 采样。
+`check` 按部署版本选择诊断：v2 检查 masked reset、60 次控制推进 120 ticks、末端单 tick和 nominal 物理；`--run` 使用同任务名义 bench 的真实 `contact_observations.jsonl` 检查初态特征／动作和首区间物理，初始 forward 显式使用 bench reset 的零 ctrl。`--contact-probe` 可读取 bench 同状态探针（task_id、cases 中的 qpos/qvel/ctrl/frame），验证非零手内接触；不再用训练合力伪造物体接触来证明一致性。没有提供 bench 观测时明确记录 parity 未检查。单元测试包含课程原生 helper／reset 调度对照、8/9 与 20/21 门限、完整序列 IK 分块与停止条件；`H2R_NATIVE_RL_SOURCE` 指向只读上游 lib/rl 时，还对照原始 forward 与连续 PPO 更新。
 
 旧版显式使用 `prepare --legacy-v1` 与 `train --train-local-imitators`；旧 `virtual-wrist-position-v1` deployment 仍可评估，保留其平滑和时钟。v1 的完整场景 imitator／逐示范训练不作为通用预训练。原生 wrench checkpoint 与两个位置控制版本都不兼容。
 
-当前准备采用 `hand-reference-v3` 和 `maniptrans-hand-physics-v2` 签名。签名包括关节限位／摩擦求解参数、执行器及几何物理、具名 mesh 对应、CCD 和其他封存物理 options；暂未覆盖的手部 tendon、equality 或显式 contact pair 会明确拒绝，物体内部约束可保留。旧参考须重新 prepare，旧 base 须重训；旧 resume 不允许跨 `training_revision=3` 接续。旧封存 deployment 仍可按其原控制契约评估。
+当前准备采用 `hand-reference-v3` 和 `maniptrans-hand-physics-v2` 签名。签名包括关节限位／摩擦求解参数、执行器及几何物理、具名 mesh 对应、CCD 和其他封存物理 options；暂未覆盖的手部 tendon、equality 或显式 contact pair 会明确拒绝，物体内部约束可保留。不满足上述签名的旧单手参考须重新 prepare。训练采用 `training_revision=4`，residual 准备采用 `preparation_revision=3`。两阶段均需以新 failure clock 重训；原有满足签名且未改变语义的单手参考可复用。旧 base、旧 residual prepared 和旧 resume 不得作为本配方继续训练。旧封存 deployment 仍可按其原控制契约评估。
 
-四真实数据集样例、短 PPO 与共同评估的具体结果保存在 bench `runs/checks/maniptrans-mjlab-20261108/`。短跑不代表全集覆盖、完整预算收敛或论文成绩；其他机器人与未实际运行的批次组合不据此宣称已验证。
+本轮短 PPO、真实接触对照与共同评估记录在 bench `runs/checks/maniptrans-native-alignment-20261108/`。短跑不代表全集覆盖、完整预算收敛或论文成绩；其他机器人与未实际运行的批次组合不据此宣称已验证。

@@ -143,7 +143,8 @@ class ReproductionAgent(PPOAgent):
 def run_training(env, params, args, output, prepared_meta, base_ids=None, diagnostic=None):
     source_root = Path(__file__).resolve().parent.parent
     source_files = sorted({*source_root.glob("maniptrans_h2r/**/*.py"), *source_root.glob("maniptrans_h2r/config/*.yaml"),
-                           *source_root.glob("lib/rl/**/*.py"), *source_root.glob("lib/utils/*.py"), source_root / "requirements-h2r.lock"})
+                           *source_root.glob("lib/rl/**/*.py"), *source_root.glob("lib/utils/*.py"),
+                           *source_root.glob("main/cfg/**/*.yaml"), source_root / "requirements-h2r.lock"})
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source_root, capture_output=True, text=True, check=False)
     write_json(output / "source.json", dict(commit=revision.stdout.strip() or None,
         files={str(p.relative_to(source_root)): sha256(p) for p in source_files},
@@ -152,7 +153,9 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
     for key in ("worlds", "epochs", "horizon", "mini_epochs", "seed", "save_every", "diagnostic_every"):
         recipe[key] = getattr(args, key)
     recipe.update(small_network=args.small_network, partial=prepared_meta.get("partial", False),
-                  training_framework="mjlab", physics_engine="mujoco_warp", training_revision=3)
+                  training_framework="mjlab", physics_engine="mujoco_warp", training_revision=4, base_sampling="native-resample",
+                  native_config_source="main/cfg/config.yaml + task and rl_train stage defaults",
+                  budget_source="H2R explicit limits")
     batch = args.worlds*args.horizon
     minibatch = min(1024, batch) if args.small_network else 1024
     if min(args.worlds, args.epochs, args.horizon, args.mini_epochs, args.save_every) < 1 or batch % minibatch or args.diagnostic_every < 0:
@@ -169,13 +172,15 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         normalize_value=True, normalize_advantage=True, value_bootstrap=True,
         gamma=recipe["gamma"], tau=recipe["tau"], learning_rate=recipe["learning_rate"], lr_schedule=recipe["lr_schedule"],
         warmup_steps=recipe.get("warmup_steps", 10), start_lr=recipe.get("start_lr", 1e-6),
-        schedule_type="standard", kl_threshold=recipe["kl_threshold"], score_to_win=float("inf"),
-        max_epochs=args.epochs, early_stop_epochs=args.epochs+1, save_best_after=10, save_frequency=0,
+        schedule_type="standard", kl_threshold=recipe["kl_threshold"], score_to_win=recipe["score_to_win"],
+        max_epochs=args.epochs, early_stop_epochs=recipe["early_stop_epochs"], save_best_after=recipe["save_best_after"], save_frequency=0,
         print_stats=True, grad_norm=1., entropy_coef=0., truncate_grads=True, e_clip=.2,
         error_if_nonfinite_gradients=True,
         horizon_length=args.horizon, minibatch_size=minibatch, mini_epochs=args.mini_epochs,
         critic_coef=4, clip_value=True, bounds_loss_coef=.0001, use_soft_clamp=True,
-        store_base_actions=args.stage == "residual", mixed_precision=False, weight_decay=0.)
+        store_base_actions=False, mixed_precision=False, weight_decay=0.)
+    write_json(output / "ppo_config.json", {k: v for k, v in config.items()
+        if k not in {"vec_env", "env_info", "features", "reward_shaper"}})
     params["config"] = config
     register()
     agent = ReproductionAgent(params, output, recipe, binding, diagnostic)
@@ -195,9 +200,13 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         raise
     finally:
         agent.writer.close()
+    if env.curriculum is not None:
+        env.audit["curriculum"] = env.curriculum.audit()
     write_json(output / "physics_audit.json", env.audit)
     write_json(output / "training.json", dict(epoch=agent.epoch_num, transitions=agent.frame,
         common_control_steps=env.common_steps, scale_factor=env.scale,
+        stop_reason=("native_score_to_win" if float(agent.last_mean_rewards) > recipe["score_to_win"]
+                     else "epoch_budget" if agent.epoch_num >= args.epochs else "native_early_stop"),
         frozen_state_unchanged=True, world_state_restarted=bool(args.resume),
         versions={p: importlib.metadata.version(p) for p in ("mjlab", "mujoco", "mujoco-warp", "warp-lang", "torch", "rl-games")}))
     if hasattr(env, "motion"):
@@ -247,6 +256,8 @@ def train_residual(args):
         root, manifest = load_artifact(path, "imitator.json")
         if manifest["format"] != "maniptrans-h2r-imitator-v1" or manifest["side"] != side:
             raise ValueError("Wrong imitator format or hand side")
+        if manifest.get("recipe", {}).get("training_revision") != 4:
+            raise ValueError("Retrain the base with the aligned failure clock (training revision 4)")
         if manifest["smoke"] and not args.allow_smoke_imitator:
             raise ValueError("Smoke base requires --allow-smoke-imitator")
         if manifest["compatibility"] != metadata["compatibility"][side] or manifest["control"] != CONTROL:

@@ -60,7 +60,7 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False):
                 thresholds = dict(thumb_tip=.04, index_tip=.045, middle_tip=.05, ring_tip=.06,
                                   pinky_tip=.06, level_1_joints=.07, level_2_joints=.08)
                 reasons = [k for k, threshold in thresholds.items()
-                           if env.elapsed_ticks[row] >= 40 and groups[k][row] > threshold]
+                           if env.completed_controls[row] > 20 and groups[k][row] > threshold]
                 results.append(dict(window=group[row], dataset=window["dataset"], source_side=window["source_side"],
                     success=bool(env.success_buf[row]), transitions=int(samples[row]),
                     start_sample=int(start_positions[row]),
@@ -98,7 +98,7 @@ def residual_tracking(model, prepared, device):
     if not initialization["valid"]:
         return dict(report, status="initialization_failed", success=False, coverage=0.,
                     collisions=initialization["collisions"])
-    env = ResidualEnv(prepared, 1, device, seed=43, from_start=True)
+    env = ResidualEnv(prepared, 1, device, seed=43, from_start=True, curriculum=False)
     env.fixed_scale = .7
     policy = Policy(model, env.action_dim, {"diagnostic": 43}, device)
     obs = env.observe()
