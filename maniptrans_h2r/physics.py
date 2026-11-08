@@ -11,15 +11,18 @@ PHYSICS_FIELDS = (
     "body_parentid", "body_pos", "body_quat", "body_mass", "body_ipos", "body_iquat", "body_inertia", "body_gravcomp",
     "jnt_type", "jnt_bodyid", "jnt_axis", "jnt_pos", "jnt_range", "jnt_limited", "jnt_actfrclimited",
     "jnt_actfrcrange", "jnt_actgravcomp", "dof_damping", "dof_armature", "dof_frictionloss",
+    "jnt_solref", "jnt_solimp", "jnt_margin", "dof_solref", "dof_solimp",
     "geom_type", "geom_bodyid", "geom_pos", "geom_quat", "geom_size", "geom_contype", "geom_conaffinity",
     "geom_friction", "geom_condim", "geom_solref", "geom_solimp", "geom_margin", "geom_gap", "geom_priority", "geom_solmix",
     "actuator_trnid", "actuator_trntype", "actuator_gaintype", "actuator_biastype", "actuator_dyntype",
     "actuator_gainprm", "actuator_biasprm", "actuator_dynprm", "actuator_gear",
     "actuator_ctrllimited", "actuator_ctrlrange", "actuator_forcelimited", "actuator_forcerange",
+    "actuator_actrange", "actuator_actlimited", "actuator_actearly", "actuator_lengthrange", "geom_fluid",
     "qpos_spring", "jnt_stiffness", "exclude_signature",
 )
 OPTION_FIELDS = ("timestep", "gravity", "integrator", "solver", "cone", "iterations", "ls_iterations",
-                 "tolerance", "ls_tolerance", "impratio", "disableflags", "enableflags")
+                 "tolerance", "ls_tolerance", "impratio", "disableflags", "enableflags",
+                 "ccd_iterations", "ccd_tolerance", "density", "viscosity", "wind", "magnetic")
 
 
 def equal(actual, expected, name, rtol=2e-5, atol=1e-9):

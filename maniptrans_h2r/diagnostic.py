@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from .io import load_artifact, read_json, write_json
-from .policy import build
+from .policy import Policy, build
 from .residual_reward import hand_inputs
 from .robot import weight_indices
 
@@ -82,6 +82,56 @@ def diagnostic_callback(prepared, output, device, allow_partial, final_epoch):
         write_json(destination / f"epoch-{epoch}.json", tracking(model, prepared, device, allow_partial))
         if epoch == final_epoch:
             write_json(destination / "final-rsi-sampled.json", tracking(model, prepared, device, allow_partial, stochastic=True))
+    return callback
+
+
+@torch.no_grad()
+def residual_tracking(model, prepared, device):
+    """Start at the evaluation pose; report the prefix before strict failure.
+
+    This uses a separate nominal training world, not the benchmark evaluator.
+    """
+    from .residual_env import ResidualEnv
+    initialization = read_json(prepared / "initialization.json")
+    report = dict(label="full-task tracking diagnostic", seed=43, strict_scale=.7,
+                  start_tick=0, initial_velocity="zero", physics_schedule="nominal")
+    if not initialization["valid"]:
+        return dict(report, status="initialization_failed", success=False, coverage=0.,
+                    collisions=initialization["collisions"])
+    env = ResidualEnv(prepared, 1, device, seed=43, from_start=True)
+    env.fixed_scale = .7
+    policy = Policy(model, env.action_dim, {"diagnostic": 43}, device)
+    obs = env.observe()
+    sums, transitions = {}, 0
+    while True:
+        obs, reward, done, _ = env.step(policy(obs, ["diagnostic"]))
+        state, target = env.state(), env.target(0)
+        errors = {"reward": float(reward[0])}
+        for side in env.sides:
+            hand = env.robot["hands"][side]
+            points = torch.stack([state["bodies"][b][:, :3] for b in hand["bodies"]], 1)
+            errors[f"{side}/keypoint_error_m"] = float((points-target[f"{side}_human"]).norm(dim=-1).mean())
+        for part in env.part_indices:
+            actual, expected = state["objects"][:, part], target["object_state"][:, part]
+            name = env.metadata["part_names"][part]
+            errors[f"{name}/position_error_m"] = float((actual[:, :3]-expected[:, :3]).norm())
+            errors[f"{name}/rotation_error_rad"] = float(2*torch.acos((actual[:, 3:7]*expected[:, 3:7]).sum().abs().clamp(max=1)))
+        for key, value in errors.items():
+            sums[key] = sums.get(key, 0.)+value
+        transitions += 1
+        if done[0]:
+            break
+    return dict(report, status="completed", task_id=env.task["task_id"], success=bool(env.success_buf[0]),
+                failure=bool(env.failure_buf[0]), terminal_tick=int(env.tick[0]), end_tick=env.task["end_tick"],
+                coverage=float(env.tick[0]/env.task["end_tick"]), transitions=transitions,
+                mean={k: v/transitions for k, v in sums.items()})
+
+
+def residual_diagnostic_callback(prepared, output, device):
+    destination = output / "diagnostics"
+    destination.mkdir()
+    def callback(model, epoch):
+        write_json(destination / f"epoch-{epoch}.json", residual_tracking(model, prepared, device))
     return callback
 
 

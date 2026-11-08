@@ -11,6 +11,45 @@ import numpy as np
 from .io import digest, sha256
 from .physics import OPTION_FIELDS, PHYSICS_FIELDS, equal, verify_sealed
 
+SIGNATURE_SCHEMA = "maniptrans-hand-physics-v2"
+REFERENCE_SCHEMA = "hand-reference-v3"
+
+
+def require_compatibility(value):
+    if value.get("schema") != SIGNATURE_SCHEMA or value.get("reference_schema") != REFERENCE_SCHEMA:
+        raise ValueError("Re-prepare references and retrain bases with the current wrist/physics schema")
+
+
+def check_hand_constraints(model, ids):
+    """Reject hand constraints not yet covered by the Sharpa signature.
+
+    Object-only constraints do not affect the reusable hand's identity.
+    """
+    import mujoco
+    sites = set(np.flatnonzero(np.isin(model.site_bodyid, ids["body"])))
+    hand_tendons = set()
+    for tendon in range(model.ntendon):
+        start, count = int(model.tendon_adr[tendon]), int(model.tendon_num[tendon])
+        for k in range(start, start+count):
+            kind, obj = model.wrap_type[k], int(model.wrap_objid[k])
+            if ((kind == mujoco.mjtWrap.mjWRAP_JOINT and obj in ids["jnt"])
+                    or (kind == mujoco.mjtWrap.mjWRAP_SITE and obj in sites)
+                    or (kind in (mujoco.mjtWrap.mjWRAP_SPHERE, mujoco.mjtWrap.mjWRAP_CYLINDER) and obj in ids["geom"])):
+                hand_tendons.add(tendon)
+    for kind, a, b in zip(model.eq_type, model.eq_obj1id, model.eq_obj2id):
+        if kind == mujoco.mjtEq.mjEQ_JOINT:
+            selected = ids["jnt"]
+        elif kind == mujoco.mjtEq.mjEQ_TENDON:
+            selected = hand_tendons
+        else:
+            selected = ids["body"]
+        if a in selected or b in selected:
+            raise ValueError("Unsupported hand equality constraint in physics signature")
+    if hand_tendons:
+        raise ValueError("Unsupported hand tendon in physics signature")
+    if any(a in ids["geom"] or b in ids["geom"] for a, b in zip(model.pair_geom1, model.pair_geom2)):
+        raise ValueError("Unsupported explicit hand contact pair in physics signature")
+
 
 def require_clock(task):
     if not np.isclose(task["dt_s"], 1/120, rtol=0, atol=1e-12) or task["control_ticks"] != 2:
@@ -39,6 +78,7 @@ def hand_ids(model, robot, side):
 def signature(model, robot, side):
     import mujoco
     ids = hand_ids(model, robot, side)
+    check_hand_constraints(model, ids)
     object_types = dict(body=mujoco.mjtObj.mjOBJ_BODY, jnt=mujoco.mjtObj.mjOBJ_JOINT,
                         geom=mujoco.mjtObj.mjOBJ_GEOM, actuator=mujoco.mjtObj.mjOBJ_ACTUATOR)
     fields = {}
@@ -62,17 +102,21 @@ def signature(model, robot, side):
         if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH:
             v, n = int(model.mesh_vertadr[m]), int(model.mesh_vertnum[m])
             f, nf = int(model.mesh_faceadr[m]), int(model.mesh_facenum[m])
-            fields["meshes"][model.mesh(m).name] = digest(dict(vertices=model.mesh_vert[v:v+n].tolist(), faces=model.mesh_face[f:f+nf].tolist()))
+            fields["meshes"][model.geom(g).name] = digest(dict(vertices=model.mesh_vert[v:v+n].tolist(), faces=model.mesh_face[f:f+nf].tolist()))
     exclusions = []
     for pair in model.exclude_signature:
         a, b = int(pair) >> 16, int(pair) & 65535
         if a in ids["body"] and b in ids["body"]:
             exclusions.append(sorted([model.body(a).name, model.body(b).name]))
     fields["exclude"] = sorted(exclusions)
-    options = {n: np.asarray(getattr(model.opt, n)).tolist() for n in OPTION_FIELDS}
-    return dict(robot_physics_id=digest(fields), physics_options_id=digest(options),
+    # Include CPU options even when MJWarp compiles them into kernels or rejects
+    # unsupported nondefaults. Different sealed settings must not share a base.
+    option_names = (*OPTION_FIELDS, "jacobian", "disableactuator", "noslip_iterations", "noslip_tolerance",
+                    "o_margin", "o_solref", "o_solimp", "o_friction", "sdf_initpoints", "sdf_iterations", "sleep_tolerance")
+    options = {n: np.asarray(getattr(model.opt, n)).tolist() for n in option_names}
+    return dict(schema=SIGNATURE_SCHEMA, robot_physics_id=digest(fields), physics_options_id=digest(options),
                 physics_dt_s=1/120, control_dt_s=1/60, decimation=2,
-                reference_schema="hand-reference-v2", control_schema="virtual-wrist-position-v2",
+                reference_schema=REFERENCE_SCHEMA, control_schema="virtual-wrist-position-v2",
                 feature_schema="maniptrans-h2r-hand-v2", fields=fields, options=options)
 
 

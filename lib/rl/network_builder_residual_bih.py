@@ -8,6 +8,7 @@ from rl_games.algos_torch import model_builder
 from rl_games.algos_torch.model_builder import NetworkBuilder as ModelNetworkBuilder
 from lib.utils.torch_utils import recurse_freeze, freeze_batchnorm_stats
 from lib.rl.models import BaseModelNetwork
+from .numerics import check_gaussian
 
 
 class ResBiHDictObsNetwork(A2CBuilder.Network):
@@ -207,6 +208,8 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
                     sigma = self.sigma_act(self.sigma)
                 else:
                     sigma = self.sigma_act(self.sigma(out))
+                if getattr(self, "check_finite", False):
+                    check_gaussian(mu, sigma, value)
                 return (
                     torch.nan_to_num(mu),
                     torch.nan_to_num(mu * 0 + sigma),

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from hydra.utils import instantiate
 from rl_games.algos_torch.network_builder import A2CBuilder, NetworkBuilder
+from .numerics import check_gaussian
 
 
 class DictObsNetwork(A2CBuilder.Network):
@@ -210,6 +211,8 @@ class DictObsNetwork(A2CBuilder.Network):
                 else:
                     sigma = self.sigma_act(self.sigma(a_out))
 
+                if getattr(self, "check_finite", False):
+                    check_gaussian(mu, sigma, value)
                 return mu, sigma, value, states
         else:
             out = obs
@@ -266,6 +269,8 @@ class DictObsNetwork(A2CBuilder.Network):
                     sigma = self.sigma_act(self.sigma)
                 else:
                     sigma = self.sigma_act(self.sigma(out))
+                if getattr(self, "check_finite", False):
+                    check_gaussian(mu, sigma, value)
                 return mu, mu * 0 + sigma, value, states
 
     def re_initialize_mu_gripper(self):

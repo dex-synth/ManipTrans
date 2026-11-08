@@ -8,6 +8,7 @@ import torch
 from rl_games.algos_torch import model_builder
 
 from lib.rl.models import ModelA2CContinuousLogStd
+from lib.rl.numerics import enable_checks
 from lib.rl.network_builder import DictObsBuilder
 from lib.rl.network_builder_residual_sh import ResRHDictObsBuilder, ResLHDictObsBuilder
 from lib.rl.network_builder_residual_bih import ResBiHDictObsBuilder
@@ -59,7 +60,7 @@ def build(params, dimensions, action_dim, device):
     config = dict(actions_num=action_dim, input_shape=space, num_seqs=1, value_size=1,
                   normalize_value=True, normalize_input=True, normalize_input_excluded_keys=[],
                   use_pid_control=False, **params)
-    return model_builder.ModelBuilder().load(params).build(config).to(device)
+    return enable_checks(model_builder.ModelBuilder().load(params).build(config).to(device))
 
 
 def resolve_bases(params, root):
@@ -74,7 +75,7 @@ def resolve_bases(params, root):
 
 class Policy:
     def __init__(self, model, action_dim, seeds, device, residual_mean=True):
-        self.model, self.action_dim, self.device = model.eval(), action_dim, device
+        self.model, self.action_dim, self.device = enable_checks(model).eval(), action_dim, device
         self.residual_mean = residual_mean
         self.generators = {key: torch.Generator(device=device).manual_seed(seed) for key, seed in seeds.items()}
 

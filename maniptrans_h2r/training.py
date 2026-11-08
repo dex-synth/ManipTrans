@@ -15,6 +15,7 @@ from rl_games.common.algo_observer import AlgoObserver
 from rl_games.common.tr_helpers import DefaultRewardsShaper
 
 from lib.rl.agent import PPOAgent
+from lib.rl.numerics import enable_checks, require_finite
 from .io import digest, load_artifact, read_json, seal, sha256, write_json
 from .policy import parameters, register
 
@@ -50,6 +51,7 @@ def frozen_state(model):
 class ReproductionAgent(PPOAgent):
     def __init__(self, params, output, recipe, binding, diagnostic=None):
         super().__init__("run", params)
+        enable_checks(self.model)
         # Native optimizer includes frozen tensors; keep only trainable residual parameters.
         self.optimizer = torch.optim.Adam((p for p in self.model.parameters() if p.requires_grad), lr=self.last_lr, eps=1e-8)
         self.output, self.recipe, self.binding = output, recipe, binding
@@ -57,6 +59,15 @@ class ReproductionAgent(PPOAgent):
         self.last_diagnostic = -1
         self.restored_best = None
         self.frozen_before = frozen_state(self.model)
+
+    def trancate_gradients_and_step(self):
+        require_finite({n: p.grad for n, p in self.model.named_parameters()}, "gradients")
+        super().trancate_gradients_and_step()
+        require_finite({n: p for n, p in self.model.named_parameters() if p.requires_grad}, "updated parameters")
+
+    def save(self, filename):
+        require_finite(self.model.state_dict(), "checkpoint")
+        return super().save(filename)
 
     def verify_frozen(self):
         if any(not torch.equal(v, self.model.state_dict()[k].detach().cpu()) for k, v in self.frozen_before.items()):
@@ -77,6 +88,9 @@ class ReproductionAgent(PPOAgent):
         if extra["binding"] != self.binding:
             raise ValueError("Resume task/corpus/base/recipe binding differs")
         self.set_full_state_weights(state)
+        require_finite(self.model.state_dict(), "restored model")
+        for values in self.optimizer.state.values():
+            require_finite({k: v for k, v in values.items() if isinstance(v, torch.Tensor)}, "restored optimizer")
         self.restored_best = self.last_mean_rewards
         self.scheduler.__dict__.update(extra["scheduler"])
         self.last_lr, self.entropy_coef = extra["last_lr"], extra["entropy_coef"]
@@ -121,6 +135,7 @@ class ReproductionAgent(PPOAgent):
 
     def save_product(self, name):
         self.verify_frozen()
+        require_finite(self.model.state_dict(), "checkpoint")
         torch.save({"model": self.model.state_dict()}, self.output / f"{name}.pth")
         torch.save(self.get_full_state_weights(), self.output / "resume.pth")
 
@@ -137,10 +152,10 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
     for key in ("worlds", "epochs", "horizon", "mini_epochs", "seed", "save_every", "diagnostic_every"):
         recipe[key] = getattr(args, key)
     recipe.update(small_network=args.small_network, partial=prepared_meta.get("partial", False),
-                  training_framework="mjlab", physics_engine="mujoco_warp")
+                  training_framework="mjlab", physics_engine="mujoco_warp", training_revision=3)
     batch = args.worlds*args.horizon
     minibatch = min(1024, batch) if args.small_network else 1024
-    if min(args.worlds, args.epochs, args.horizon, args.mini_epochs, args.save_every) < 1 or batch % minibatch:
+    if min(args.worlds, args.epochs, args.horizon, args.mini_epochs, args.save_every) < 1 or batch % minibatch or args.diagnostic_every < 0:
         raise ValueError("Require positive sizes and a batch divisible by minibatch (1024 outside smoke mode)")
     recipe["minibatch"] = minibatch
     (output / "resolved_config.yaml").write_text(yaml.safe_dump(recipe, sort_keys=True))
@@ -157,6 +172,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         schedule_type="standard", kl_threshold=recipe["kl_threshold"], score_to_win=float("inf"),
         max_epochs=args.epochs, early_stop_epochs=args.epochs+1, save_best_after=10, save_frequency=0,
         print_stats=True, grad_norm=1., entropy_coef=0., truncate_grads=True, e_clip=.2,
+        error_if_nonfinite_gradients=True,
         horizon_length=args.horizon, minibatch_size=minibatch, mini_epochs=args.mini_epochs,
         critic_coef=4, clip_value=True, bounds_loss_coef=.0001, use_soft_clamp=True,
         store_base_actions=args.stage == "residual", mixed_precision=False, weight_decay=0.)
@@ -168,12 +184,17 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         if agent.epoch_num >= args.epochs:
             raise ValueError("Resume epoch must be below requested total --epochs")
     before = {k: v.detach().clone() for k, v in agent.model.named_parameters() if v.requires_grad}
-    agent.train()
-    if not any(not torch.equal(v, dict(agent.model.named_parameters())[k]) for k, v in before.items()):
-        raise RuntimeError("No trainable parameter changed")
-    agent.diagnostic()
-    agent.save_product("model")
-    agent.writer.close()
+    try:
+        agent.train()
+        if not any(not torch.equal(v, dict(agent.model.named_parameters())[k]) for k, v in before.items()):
+            raise RuntimeError("No trainable parameter changed")
+        agent.diagnostic()
+        agent.save_product("model")
+    except Exception as exc:
+        write_json(output / "failure.json", dict(type=type(exc).__name__, error=str(exc), epoch=agent.epoch_num, frame=agent.frame))
+        raise
+    finally:
+        agent.writer.close()
     write_json(output / "physics_audit.json", env.audit)
     write_json(output / "training.json", dict(epoch=agent.epoch_num, transitions=agent.frame,
         common_control_steps=env.common_steps, scale_factor=env.scale,
@@ -212,6 +233,7 @@ def train_imitator(args):
 
 def train_residual(args):
     from .residual_env import ResidualEnv
+    from .diagnostic import residual_diagnostic_callback
     from .mjlab_env import CONTROL
     torch.set_num_threads(4)
     seed_all(args.seed)
@@ -255,7 +277,8 @@ def train_residual(args):
     for side, prefix in (("right", "rh"), ("left", "lh")):
         if side in manifests:
             params["network"][f"{prefix}_base_model"] = deepcopy(manifests[side]["params"]["network"])
-    saved, recipe = run_training(env, params, args, output, metadata, {s: m["id"] for s, m in manifests.items()})
+    saved, recipe = run_training(env, params, args, output, metadata, {s: m["id"] for s, m in manifests.items()},
+        diagnostic=residual_diagnostic_callback(output / "prepared", output, args.device))
     for side, prefix in (("right", "rh"), ("left", "lh")):
         if side in bases:
             saved["model"][f"{prefix}_base_model_checkpoint"] = f"{side}-base.pth"

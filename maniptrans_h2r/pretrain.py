@@ -64,7 +64,8 @@ def prepare(args):
                     reference = reference_from_points(model, robot, args.side, points, times)
                     values = pack(reference, args.side)
                 except ValueError as exc:
-                    errors.append(dict(clip_id=clip["id"], synthetic=synthetic, reason=str(exc)))
+                    errors.append(dict(clip_id=clip["id"], dataset=clip["dataset"], source_interval=clip["source_interval"],
+                                       synthetic=synthetic, endpoints=endpoints, reason=str(exc)))
                     if not args.allow_incomplete:
                         write_json(output / "reference_errors.json", errors)
                         raise

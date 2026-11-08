@@ -10,6 +10,7 @@ from .io import load_artifact, read_json, sha256
 from .mjlab_env import MjlabVecEnv, hand_model
 from .motion import MotionCache
 from .residual_reward import hand_reward
+from .robot_physics import require_compatibility
 
 
 class ImitatorEnv(MjlabVecEnv):
@@ -19,6 +20,7 @@ class ImitatorEnv(MjlabVecEnv):
             raise ValueError("Expected generalist pretraining reference")
         if metadata["partial"] and not allow_partial:
             raise ValueError("Partial corpus requires --allow-incomplete")
+        require_compatibility(metadata["compatibility"])
         robot = read_json(self.path / "robot_mapping.json")
         self.side = robot["sides"][0]
         model, bodies = hand_model(self.path / "robot_scene.xml", robot)
@@ -50,6 +52,7 @@ class ImitatorEnv(MjlabVecEnv):
         self.motion.reset(indices, fixed_windows=fixed, from_start=self.diagnostic)
         target = self.target(0)
         wrist = target[f"{self.side}_wrist"][ids].cpu().numpy()
+        anchors = target["robot_q"][ids][:, self.robot["hands"][self.side]["indices"][3:6]].cpu().numpy()
         count = len(indices)
         lower, upper = np.asarray(self.robot["lower"]), np.asarray(self.robot["upper"])
         q = np.broadcast_to(np.clip(np.pi/36, lower, upper), (count, len(lower))).copy()
@@ -65,7 +68,7 @@ class ImitatorEnv(MjlabVecEnv):
                     axis = self.rng.random(3)
                     r = Rotation.from_rotvec(axis/np.linalg.norm(axis)*self.rng.normal(0, np.pi/18))*r
                 try:
-                    q[i, :6] = self.wrist.solve(p[None], r.as_matrix()[None])[0]
+                    q[i, :6] = self.wrist.solve(p[None], r.as_matrix()[None], previous=anchors[i])[0]
                     break
                 except ValueError:
                     if attempt == 7:

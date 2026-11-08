@@ -446,7 +446,8 @@ class MyA2CBase(BaseAlgorithm):
 
         if self.truncate_grads:
             self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm,
+                                     error_if_nonfinite=self.config.get("error_if_nonfinite_gradients", False))
 
         self.scaler.step(self.optimizer)
         self.scaler.update()

@@ -3,7 +3,6 @@
 from contextlib import contextmanager
 from functools import lru_cache
 import inspect
-import itertools
 import warnings
 
 import numpy as np
@@ -33,25 +32,43 @@ def velocities(points, quat, times):
 
 
 def continuous_euler(rotations, lower, upper, previous=None):
+    """Lift SO(3) before applying limits; never wrap a joint to escape a limit.
+
+    Whole clips may choose a different *constant* equivalent branch. A supplied
+    previous pose instead anchors RSI locally: illegal noise must be resampled.
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         eulers = Rotation.from_matrix(rotations).as_euler("XYZ")
     result = []
-    previous = np.zeros(3) if previous is None else np.asarray(previous)
-    shifts = np.asarray(list(itertools.product((-1, 0, 1), repeat=3)))*2*np.pi
+    anchor = np.zeros(3) if previous is None else np.asarray(previous)
+    last = anchor.copy()
     for matrix, angles in zip(rotations, eulers):
         bases = [angles, np.array([angles[0]+np.pi, np.pi-angles[1], angles[2]+np.pi])]
         if abs(np.cos(angles[1])) < 1e-7:
-            bases.append(np.array([angles[0]-np.sign(angles[1])*previous[2], angles[1], previous[2]]))
-        candidates = (np.asarray(bases)[:, None] + shifts).reshape(-1, 3)
-        candidates = candidates[((candidates >= lower-1e-8) & (candidates <= upper+1e-8)).all(axis=1)]
-        if len(candidates) == 0:
-            raise ValueError("robot_reference_invalid: no legal wrist rotation branch")
-        previous = candidates[np.argmin(np.linalg.norm(candidates-previous, axis=1))]
-        if not np.allclose(Rotation.from_euler("XYZ", previous).as_matrix(), matrix, atol=1e-5):
+            bases.append(np.array([angles[0]-np.sign(angles[1])*last[2], angles[1], last[2]]))
+        candidates = np.asarray(bases)
+        candidates += 2*np.pi*np.rint((last-candidates)/(2*np.pi))
+        last = candidates[np.argmin(np.linalg.norm(candidates-last, axis=1))]
+        if not np.allclose(Rotation.from_euler("XYZ", last).as_matrix(), matrix, atol=1e-5):
             raise ValueError("Wrist Euler inverse failed FK check")
-        result.append(previous.copy())
-    return np.asarray(result)
+        result.append(last.copy())
+    result = np.asarray(result)
+    if previous is None:
+        alternate = result*np.array([1, -1, 1])+np.pi
+        legal = []
+        for path in (result, alternate):
+            lo = np.ceil((np.asarray(lower)-path.min(axis=0)-1e-8)/(2*np.pi))
+            hi = np.floor((np.asarray(upper)-path.max(axis=0)+1e-8)/(2*np.pi))
+            if np.all(lo <= hi):
+                shift = np.clip(np.rint((anchor-path[0])/(2*np.pi)), lo, hi)
+                legal.append(path+2*np.pi*shift)
+        if not legal:
+            raise ValueError("robot_reference_invalid: no legal continuous wrist rotation branch")
+        result = min(legal, key=lambda path: np.linalg.norm(path[0]-anchor))
+    if np.any(result < np.asarray(lower)-1e-7) or np.any(result > np.asarray(upper)+1e-7):
+        raise ValueError("robot_reference_invalid: anchored wrist rotation branch outside limits")
+    return result
 
 
 class WristReference:

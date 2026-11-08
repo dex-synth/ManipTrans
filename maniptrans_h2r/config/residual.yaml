@@ -12,7 +12,7 @@ lr_schedule: warmup
 warmup_steps: 10
 start_lr: 0.000001
 save_every: 100
-diagnostic_every: 0
+diagnostic_every: 100
 control_hz: 60
 physics_hz: 120
 decimation: 2

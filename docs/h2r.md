@@ -43,6 +43,8 @@ for side in right left; do
 
 Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实时间导数、连续腕 Euler 分支及 Jacobian 速度换算在方法侧处理；阶段 1 不做手指 IK。原生奖励与阈值课程保持，课程按控制调用计数，终止保留窗口最后一帧。
 
+腕旋转先不加限位地连续展开，再为整段选择合法的固定等价分支及 `2π` 偏移；不能在撞限位的帧换分支。整段无可行连续表示则记录 `robot_reference_invalid`，默认停止准备，显式 partial 模式才跳过。RSI 以抽中帧的参考腕角锚定分支；噪声越界时重采，不跳转到另一圈。
+
 部分 corpus 必须显式使用 `--allow-incomplete`。功能检查可加 `--small-network --worlds 8 --epochs 2 --diagnostic-every 0`；即使跳过中间诊断，最终仍做均值和 RSI 随机策略诊断。小网络或部分数据产物标记 `smoke=true`，不能用于默认正式 residual 入口。
 
 `pretrain check --imitator BASE --prepared PRETRAIN --output CHECK --device cuda:0` 单独执行固定诊断。报告名为 `training-corpus tracking diagnostic`，与训练数据重叠；严格 scale=0.7，报告 wrist、指尖／关节组、功率、有效前缀和时域覆盖。它不是 manipulation SR 或未见序列泛化结果。
@@ -68,6 +70,8 @@ Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实
 
 `config/residual.yaml` 默认 4096 环境、10000 epochs、32/1024/5 PPO 配方；残差 init gain=.01、logstd=-1，保留原生 warmup 调用顺序。全部 base 参数和 normalizer buffers 冻结并在保存时核验；PPO 重算使用 rollout 时保存的 base 样本。物体质量、重力、接触、弹簧和 servo gains 在整个课程中保持 task 名义值。
 
+阶段 2 默认在 epoch 0、每 100 epochs 和最终 epoch 执行 `full-task tracking diagnostic`，写入 `diagnostics/epoch-N.json`。独立 nominal world 使用固定首帧机器人姿态、task 物体初态、零速度、seed 43、随机 base／residual 均值和严格 scale=.7；从头运行至原生失败或真实末端，记录有效前缀覆盖、终止 tick 及各计分部件误差。首帧碰撞不通过则明确记录初始化失败。这些诊断不更新 normalizer、训练 RNG、训练 world 或课程，也不是 bench SR。`--diagnostic-every 0` 可关闭中间诊断，最终诊断仍执行。
+
 ## 控制、物理与产物
 
 动作经原生 soft clamp 后，每手解码为：
@@ -81,7 +85,7 @@ finger = lower + (clamp(base + 2 * residual, -1, 1) + 1) / 2 * (upper - lower)
 
 接触／约束缓冲容量分别在两份 YAML 中固定：单手 128/1024，完整场景 512/2048。容量不足明确报错，不截断接触或自动减少环境数。
 
-每个控制区间只采样／解码一次动作，调用两次 `Simulation.step()`；任务末端剩一个 physics tick 时仅执行一次。实际最后一次 solve 的力与求解前速度构成功率；积分后仅刷新运动学，避免额外 full forward 覆盖接触求解结果。每指接触 sensor 精确匹配该 body 的碰撞 geoms，包含全部接触伙伴；在线状态使用 bench 真实 contact records。
+每个控制区间只采样／解码一次动作，调用两次 `Simulation.step()`；任务末端剩一个 physics tick 时仅执行一次。功率使用实际最后一次 solve 的执行力乘该物理步积分后的速度，与原生 reward 和训练计划一致；提前到末端的 world 保留自身最后一步的功率。积分后仅刷新运动学，避免额外 full forward 覆盖接触求解结果。每指接触 sensor 精确匹配该 body 的碰撞 geoms，包含全部接触伙伴；在线状态使用 bench 真实 contact records。
 
 训练核验封存 CPU 模型、sensor 模型和 GPU 实际参数，显式恢复 MJWarp 的 solver tolerance。Bench MJWarp runtime 可能保留 float32 的 `1e-6` 下限；相同物理参数不意味着长轨迹逐位等价。
 
@@ -96,6 +100,8 @@ finger = lower + (clamp(base + 2 * residual, -1, 1) + 1) / 2 * (upper - lower)
 | `resolved_config.yaml`, `source.json`, `training.json` | 实际配方、源码 hash、依赖／GPU 版本与训练步数 |
 
 输出目录必须不存在。续训传 `--resume /old/output/resume.pth --output /new/output --epochs TOTAL`，其余影响学习的参数与输入身份保持一致。只在完整 PPO epoch 边界恢复，重新 reset 训练 worlds，记录 `world_state_restarted=true`，不承诺与不中断运行逐位一致。
+
+H2R 入口在原生 residual 的 `nan_to_num` 之前检查网络输出和 Gaussian 标准差，并检查梯度、更新后参数、恢复和保存的模型状态。非有限训练结果产生 `failure.json` 并停止，不生成成功 deployment；原生 IsaacGym 默认入口不启用这些检查。
 
 ## 统一评估与批次
 
@@ -121,5 +127,7 @@ Bench 按同一 task/spec 启动 `evaluate-server` 后连接：
 `check` 按部署版本选择诊断：v2 检查 train/client 特征与动作、masked reset、60 次控制推进 120 ticks、末端单 tick、名义物理不变；`--run` 可增加同任务名义 bench 首区间对照。单元测试包含窗口覆盖、腕分支、采样质量、全物体 reward 和条件 base 采样。
 
 旧版显式使用 `prepare --legacy-v1` 与 `train --train-local-imitators`；旧 `virtual-wrist-position-v1` deployment 仍可评估，保留其平滑和时钟。v1 的完整场景 imitator／逐示范训练不作为通用预训练。原生 wrench checkpoint 与两个位置控制版本都不兼容。
+
+当前准备采用 `hand-reference-v3` 和 `maniptrans-hand-physics-v2` 签名。签名包括关节限位／摩擦求解参数、执行器及几何物理、具名 mesh 对应、CCD 和其他封存物理 options；暂未覆盖的手部 tendon、equality 或显式 contact pair 会明确拒绝，物体内部约束可保留。旧参考须重新 prepare，旧 base 须重训；旧 resume 不允许跨 `training_revision=3` 接续。旧封存 deployment 仍可按其原控制契约评估。
 
 四真实数据集样例、短 PPO 与共同评估的具体结果保存在 bench `runs/checks/maniptrans-mjlab-20261108/`。短跑不代表全集覆盖、完整预算收敛或论文成绩；其他机器人与未实际运行的批次组合不据此宣称已验证。

@@ -8,15 +8,18 @@ from .mjlab_env import MjlabVecEnv
 from .observations import Reference
 from .physics import load_model
 from .residual_reward import residual_reward
-from .robot_physics import require_clock
+from .robot_physics import require_clock, require_compatibility
 from .rsi import sampling_probabilities
+from .robot import initial_qpos
 
 
 class ResidualEnv(MjlabVecEnv):
-    def __init__(self, prepared, count, device, seed=42):
+    def __init__(self, prepared, count, device, seed=42, *, from_start=False):
         self.path, metadata = load_artifact(prepared)
         if metadata["format"] != "maniptrans-h2r-prepared-v2":
             raise ValueError("Prepare a v2 task before residual training")
+        for value in metadata["compatibility"].values():
+            require_compatibility(value)
         self.task_path, self.task = load_task(self.path / "task")
         require_clock(self.task)
         robot = read_json(self.path / "robot_mapping.json")
@@ -26,6 +29,10 @@ class ResidualEnv(MjlabVecEnv):
         self.rsi = load_arrays(self.path / "rsi.npz")
         self.rsi_probability = sampling_probabilities(len(self.rsi["ticks"]), self.rsi["valid_start"])
         self.rng = np.random.default_rng(seed)
+        self.from_start = from_start
+        self.initialization = read_json(self.path / "initialization.json")
+        if from_start and not self.initialization["valid"]:
+            raise ValueError("Initial robot pose failed collision admission")
         self.part_indices = [metadata["part_names"].index(p) for p in metadata["scoring_parts"]]
         super().__init__(model, robot, bodies, pairs, count, device, metadata, "residual")
         self.object_qids = [int(model.joint(n).qposadr[0]) for n in self.task["object"]["joints"].values()]
@@ -39,6 +46,14 @@ class ResidualEnv(MjlabVecEnv):
         return self.task["end_tick"]-self.tick
 
     def reset_states(self, ids):
+        if self.from_start:
+            qpos = initial_qpos(self.cpu, self.task)
+            qpos[self.robot["qpos_indices"]] = self.initialization["robot_q"]
+            self.views["qpos"][ids] = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+            self.views["qvel"][ids] = 0
+            self.tick[ids] = 0
+            self.views["time"][ids] = 0
+            return
         indices = self.rng.choice(len(self.rsi_probability), len(ids), p=self.rsi_probability)
         for key in ("qpos", "qvel"):
             self.views[key][ids] = torch.tensor(self.rsi[key][indices], dtype=torch.float32, device=self.device)

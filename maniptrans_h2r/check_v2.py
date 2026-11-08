@@ -59,6 +59,10 @@ def check(args):
     expected = torch.tensor([[commands[f'e{i}']['joint_targets'][n] for n in robot['joint_names']] for i in range(2)], device=args.device)
     torch.testing.assert_close(targets, expected, rtol=1e-5, atol=1e-6)
     env.step(actions)
+    def check_power():
+        expected = env.views['qfrc_actuator'][:, robot['qvel_indices']]*env.views['qvel'][:, robot['qvel_indices']]
+        torch.testing.assert_close(env.last_power, expected, rtol=0, atol=0)
+    check_power()
     kept = {k: v[0].clone() for k, v in env.views.items()}
     history = {s: v[0].clone() for s, v in env.contact_history.items()}
     forces = {s: v[0].clone() for s, v in env.tip_force.items()}
@@ -83,12 +87,13 @@ def check(args):
     env.tick[:] = task['end_tick']-1
     before = env.views['time'].clone()
     _, _, done, info = env.step(torch.zeros_like(actions))
+    check_power()
     assert done.all() and env.tick.tolist() == [task['end_tick']]*2 and not info['time_outs'].any()
     torch.testing.assert_close(env.views['time']-before, torch.full_like(before, 1/120), rtol=0, atol=1e-7)
     audit = gpu_audit(env.cpu, env.model, task, env.metadata['scene_sha256'])
     assert audit['fields'] == env.audit['fields'] and audit['options'] == env.audit['options']
     report = dict(task_id=task['task_id'], feature_and_target_parity=True, masked_reset=True,
-                  sixty_controls_120_ticks=True, one_tick_terminal=True, nominal_physics_unchanged=True)
+                  sixty_controls_120_ticks=True, one_tick_terminal=True, post_step_power=True, nominal_physics_unchanged=True)
     if args.run:
         import json
         run = Path(args.run)

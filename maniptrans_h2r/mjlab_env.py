@@ -182,11 +182,11 @@ class MjlabVecEnv:
             active = steps > substep
             inactive = ~active
             saved = {k: v[inactive].clone() for k, v in self.views.items()}
-            solve_velocity = self.views["qvel"][:, self.robot["qvel_indices"]].clone()
             self.sim.step()
             if torch.any(wp.to_torch(self.data.overflow) != 0):
                 raise RuntimeError("MJWarp constraint/contact capacity exceeded")
-            power[active] = (self.views["qfrc_actuator"][:, self.robot["qvel_indices"]]*solve_velocity)[active]
+            power[active] = (self.views["qfrc_actuator"][:, self.robot["qvel_indices"]]
+                             * self.views["qvel"][:, self.robot["qvel_indices"]])[active]
             forces = self.contacts()
             for s in self.sides:
                 self.tip_force[s][active] = forces[s][active]
