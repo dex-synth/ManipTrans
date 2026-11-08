@@ -189,3 +189,9 @@ make*.py
 
 runs
 runs/*
+
+# H2R integration source and dependency recipes
+!maniptrans_h2r/evaluate.py
+!tests/h2r/test_*.py
+!requirements-h2r.txt
+!requirements-h2r-overrides.txt

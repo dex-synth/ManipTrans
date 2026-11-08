@@ -110,7 +110,7 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
         self.rh_base_model = self.rh_base_net.build(params["name"], **config)
         self.loaded_checkpoint = True
         if params["base_model"]["rh_checkpoint"] is not None:
-            rh_base_model_ckp = torch.load(params["base_model"]["rh_checkpoint"])
+            rh_base_model_ckp = torch.load(params["base_model"]["rh_checkpoint"], map_location="cpu")
             self.rh_base_model.load_state_dict(
                 {k.replace("a2c_network.", ""): v for k, v in rh_base_model_ckp["model"].items() if "a2c_network" in k}
             )
@@ -120,6 +120,7 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
             cprint("\nWARNING: The first-stage imitator model is not loaded, using random weights instead.", "red")
             cprint("WARNING: This may slow convergence. Consider pretraining the imitator model.\n", "red")
             self.loaded_checkpoint = False
+        self.rh_base_model.requires_grad_(False)
         recurse_freeze(self.rh_base_model)
         freeze_batchnorm_stats(self.rh_base_model)
         self.rh_base_model.eval()
@@ -128,7 +129,7 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
         self.lh_base_net = builder.load(params["base_model"])
         self.lh_base_model = self.lh_base_net.build(params["name"], **config)
         if params["base_model"]["lh_checkpoint"] is not None:
-            lh_base_model_ckp = torch.load(params["base_model"]["lh_checkpoint"])
+            lh_base_model_ckp = torch.load(params["base_model"]["lh_checkpoint"], map_location="cpu")
             self.lh_base_model.load_state_dict(
                 {k.replace("a2c_network.", ""): v for k, v in lh_base_model_ckp["model"].items() if "a2c_network" in k}
             )
@@ -138,6 +139,7 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
             cprint("\nWARNING: The first-stage imitator model is not loaded, using random weights instead.", "red")
             cprint("WARNING: This may slow convergence. Consider pretraining the imitator model.\n", "red")
             self.loaded_checkpoint = False
+        self.lh_base_model.requires_grad_(False)
         recurse_freeze(self.lh_base_model)
         freeze_batchnorm_stats(self.lh_base_model)
         self.lh_base_model.eval()
@@ -174,6 +176,13 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
             lh_base_sigma = torch.exp(lh_base_logstd)
             lh_base_distr = torch.distributions.Normal(lh_base_mu, lh_base_sigma, validate_args=False)
             lh_base_action = lh_base_distr.sample()
+
+            if "base_actions" in obs_dict:
+                rh_base_action, lh_base_action = obs_dict["base_actions"].chunk(2, dim=-1)
+            elif "base_noise" in obs_dict:
+                rh_noise, lh_noise = obs_dict["base_noise"].chunk(2, dim=-1)
+                rh_base_action = rh_base_mu + rh_base_sigma * rh_noise
+                lh_base_action = lh_base_mu + lh_base_sigma * lh_noise
 
             if not self.loaded_checkpoint:
                 rh_base_action = torch.zeros_like(rh_base_action)

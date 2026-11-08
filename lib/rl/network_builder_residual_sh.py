@@ -107,7 +107,7 @@ class ResRHDictObsNetwork(A2CBuilder.Network):
         self.base_net = builder.load(params["base_model"])
         self.base_model = self.base_net.build(params["name"], **config)
         if params["base_model"][self.side_checkpoint] is not None:
-            base_model_ckp = torch.load(params["base_model"][self.side_checkpoint])
+            base_model_ckp = torch.load(params["base_model"][self.side_checkpoint], map_location="cpu")
             self.base_model.load_state_dict(
                 {k.replace("a2c_network.", ""): v for k, v in base_model_ckp["model"].items() if "a2c_network" in k}
             )
@@ -118,6 +118,7 @@ class ResRHDictObsNetwork(A2CBuilder.Network):
             cprint("\nWARNING: The first-stage imitator model is not loaded, using random weights instead.", "red")
             cprint("WARNING: This may slow convergence. Consider pretraining the imitator model.\n", "red")
             self.loaded_checkpoint = False
+        self.base_model.requires_grad_(False)
         recurse_freeze(self.base_model)
         freeze_batchnorm_stats(self.base_model)
         self.base_model.eval()
@@ -149,7 +150,12 @@ class ResRHDictObsNetwork(A2CBuilder.Network):
 
             base_sigma = torch.exp(base_logstd)
             base_distr = torch.distributions.Normal(base_mu, base_sigma, validate_args=False)
-            base_action = base_distr.sample()
+            if "base_actions" in obs_dict:
+                base_action = obs_dict["base_actions"]
+            elif "base_noise" in obs_dict:
+                base_action = base_mu + base_sigma * obs_dict["base_noise"]
+            else:
+                base_action = base_distr.sample()
 
             if not self.loaded_checkpoint:
                 base_action = torch.zeros_like(base_action)

@@ -34,7 +34,7 @@ class ModelA2CContinuousLogStdResRH(BaseModel):
             )
             self.base_model = BaseModelNetwork(**base_model_kwargs)
             if kwargs["rh_base_model_checkpoint"] is not None:
-                base_model_ckp = torch.load(kwargs["rh_base_model_checkpoint"])
+                base_model_ckp = torch.load(kwargs["rh_base_model_checkpoint"], map_location="cpu")
                 self.base_model.load_state_dict(
                     {k: v for k, v in base_model_ckp["model"].items() if "a2c_network" not in k}
                 )
@@ -43,6 +43,7 @@ class ModelA2CContinuousLogStdResRH(BaseModel):
 
                 cprint("\nWARNING: The first-stage imitator model is not loaded, using random weights instead.", "red")
                 cprint("WARNING: This may slow convergence. Consider pretraining the imitator model.\n", "red")
+            self.base_model.requires_grad_(False)
             recurse_freeze(self.base_model)
             freeze_batchnorm_stats(self.base_model)
             self.base_model.eval()
@@ -138,7 +139,7 @@ class ModelA2CContinuousLogStdResLH(BaseModel):
             )
             self.base_model = BaseModelNetwork(**base_model_kwargs)
             if kwargs["lh_base_model_checkpoint"] is not None:
-                base_model_ckp = torch.load(kwargs["lh_base_model_checkpoint"])
+                base_model_ckp = torch.load(kwargs["lh_base_model_checkpoint"], map_location="cpu")
                 self.base_model.load_state_dict(
                     {k: v for k, v in base_model_ckp["model"].items() if "a2c_network" not in k}
                 )
@@ -147,6 +148,7 @@ class ModelA2CContinuousLogStdResLH(BaseModel):
 
                 cprint("\nWARNING: The first-stage imitator model is not loaded, using random weights instead.", "red")
                 cprint("WARNING: This may slow convergence. Consider pretraining the imitator model.\n", "red")
+            self.base_model.requires_grad_(False)
             recurse_freeze(self.base_model)
             freeze_batchnorm_stats(self.base_model)
             self.base_model.eval()
@@ -243,7 +245,7 @@ class ModelA2CContinuousLogStdResBiH(BaseModel):
             self.rh_base_model = BaseModelNetwork(**base_model_kwargs)
             self.lh_base_model = BaseModelNetwork(**base_model_kwargs)
             if kwargs["rh_base_model_checkpoint"] is not None:
-                rh_base_model_ckp = torch.load(kwargs["rh_base_model_checkpoint"])
+                rh_base_model_ckp = torch.load(kwargs["rh_base_model_checkpoint"], map_location="cpu")
                 self.rh_base_model.load_state_dict(
                     {k: v for k, v in rh_base_model_ckp["model"].items() if "a2c_network" not in k}
                 )
@@ -252,11 +254,12 @@ class ModelA2CContinuousLogStdResBiH(BaseModel):
 
                 cprint("\nWARNING: The first-stage imitator model is not loaded, using random weights instead.", "red")
                 cprint("WARNING: This may slow convergence. Consider pretraining the imitator model.\n", "red")
+            self.rh_base_model.requires_grad_(False)
             recurse_freeze(self.rh_base_model)
             freeze_batchnorm_stats(self.rh_base_model)
             self.rh_base_model.eval()
             if kwargs["lh_base_model_checkpoint"] is not None:
-                lh_base_model_ckp = torch.load(kwargs["lh_base_model_checkpoint"])
+                lh_base_model_ckp = torch.load(kwargs["lh_base_model_checkpoint"], map_location="cpu")
                 self.lh_base_model.load_state_dict(
                     {k: v for k, v in lh_base_model_ckp["model"].items() if "a2c_network" not in k}
                 )
@@ -265,6 +268,7 @@ class ModelA2CContinuousLogStdResBiH(BaseModel):
 
                 cprint("\nWARNING: The first-stage imitator model is not loaded, using random weights instead.", "red")
                 cprint("WARNING: This may slow convergence. Consider pretraining the imitator model.\n", "red")
+            self.lh_base_model.requires_grad_(False)
             recurse_freeze(self.lh_base_model)
             freeze_batchnorm_stats(self.lh_base_model)
             self.lh_base_model.eval()

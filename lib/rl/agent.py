@@ -122,6 +122,9 @@ class PPOAgent(MyContinuousA2CBase):
             "obs": obs_batch,
         }
 
+        if "base_actions" in input_dict:
+            batch_dict["base_actions"] = input_dict["base_actions"]
+
         error_masks = input_dict.get("error_masks", None)
 
         rnn_masks = None

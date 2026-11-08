@@ -1,0 +1,3 @@
+# Gym's optional classic-control renderer pins a release without Python 3.11 wheels.
+# ManipTrans uses neither this renderer nor Gym's classic-control environments.
+pygame==2.6.1

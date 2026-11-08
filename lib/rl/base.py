@@ -1110,6 +1110,11 @@ class MyContinuousA2CBase(MyA2CBase):
         self.update_list = ["actions", "neglogpacs", "values", "mus", "sigmas"]
         self.tensor_list = self.update_list + ["obses", "states", "dones"]
         self.tensor_list = self.tensor_list + ["error_masks"]
+        if self.config.get("store_base_actions", False):
+            self.experience_buffer.tensor_dict["base_actions"] = torch.zeros_like(
+                self.experience_buffer.tensor_dict["actions"])
+            self.update_list.append("base_actions")
+            self.tensor_list.append("base_actions")
 
     def train_epoch(self):
         super().train_epoch()
@@ -1265,6 +1270,9 @@ class MyContinuousA2CBase(MyA2CBase):
         dataset_dict["error_masks"] = error_masks
         dataset_dict["mu"] = mus
         dataset_dict["sigma"] = sigmas
+
+        if "base_actions" in batch_dict:
+            dataset_dict["base_actions"] = batch_dict["base_actions"]
 
         self.dataset.update_values_dict(dataset_dict)
 
