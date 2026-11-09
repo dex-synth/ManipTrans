@@ -1,6 +1,6 @@
 # h2r_bench 接入
 
-`maniptrans_h2r` 实现通用单手 imitator 预训练和逐任务 residual 训练。训练框架为 **mjlab 1.6.0 的公共 `Simulation`**，物理引擎为 MJWarp；控制 60 Hz、物理 120 Hz、decimation=2，阶段 1 默认每手 8192 个环境，阶段 2 默认 4096 个环境。原生 `lib/rl` 的 PPO、网络、normalizer 与奖励函数复用；环境直接组合 `Simulation`，自行管理 reward、RSI 和 terminal，避免引入 ManagerBasedRlEnv 的自动 reset 和 dt 奖励缩放。
+`maniptrans_h2r` 实现通用单手 imitator 预训练和逐任务 residual 训练。训练框架为 **mjlab 1.6.0 的公共 `Simulation`**，物理引擎为 MJWarp；控制 60 Hz、物理 120 Hz、decimation=2。单次训练的默认环境数为阶段 1 的 8192 和阶段 2 的 4096。原生 `lib/rl` 的 PPO、网络、normalizer 与奖励函数复用；环境直接组合 `Simulation`，自行管理 reward、RSI 和 terminal，避免引入 ManagerBasedRlEnv 的自动 reset 和 dt 奖励缩放。
 
 本版本身份为 `maniptrans-mjlab / virtual-wrist-position-v3`。这是保留原生训练主体的共同任务适配：数据集、机器人、simulator 和腕控制均与论文环境不同，不能称为论文结果的精确复现。原生 IsaacGym 入口仍保留。方法代码不导入 bench；bench 独立生成任务、推进评估世界和计分。阶段 1 的上游差异与参数见 [imitator 适配说明](h2r_phase1_imitator_adaptation.md)。
 
