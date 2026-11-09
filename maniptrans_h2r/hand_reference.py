@@ -243,6 +243,15 @@ def mano_model(directory, side, fix):
     return model
 
 
+def interpolation_times(times, source_times):
+    """Snap sub-nanosecond endpoint roundoff, but reject real extrapolation."""
+    times = np.asarray(times, dtype=np.float64)
+    lower, upper = source_times[0], source_times[-1]
+    if not np.isfinite(times).all() or np.any(times < lower-1e-9) or np.any(times > upper+1e-9):
+        raise ValueError(f"Interpolation times outside source interval [{lower}, {upper}]")
+    return np.clip(times, lower, upper)
+
+
 def interpolate_motion(arrays, metadata, times, mano_dir, *, endpoints=None, mirror=False):
     """SLERP absolute MANO rotations, decode, then anchor to the real wrist."""
     import torch
@@ -251,10 +260,12 @@ def interpolate_motion(arrays, metadata, times, mano_dir, *, endpoints=None, mir
     positions = arrays["joints_m"][:, 0]
     if endpoints is not None:
         # First query the selected original poses, then interpolate between them.
+        endpoints = interpolation_times(endpoints, source_times)
         position = np.stack([np.interp(endpoints, source_times, positions[:, j]) for j in range(3)], axis=-1)
         quat = np.stack([Slerp(source_times, Rotation.from_quat(source_quat[:, j], scalar_first=True))(endpoints).as_quat(scalar_first=True)
                          for j in range(16)], axis=1)
         source_times, source_quat, positions = np.array([0., endpoints[1]-endpoints[0]]), quat, position
+    times = interpolation_times(times, source_times)
     quat = np.stack([Slerp(source_times, Rotation.from_quat(source_quat[:, j], scalar_first=True))(times).as_rotvec()
                      for j in range(16)], axis=1).reshape(-1, 48)
     wrist = np.stack([np.interp(times, source_times, positions[:, j]) for j in range(3)], axis=-1)
