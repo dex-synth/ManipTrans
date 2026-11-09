@@ -156,8 +156,9 @@ def test_diagnostics_run_at_epoch_boundaries_without_changing_rng_or_mode(monkey
     agent.model = torch.nn.Linear(1, 1).train()
     agent.recipe = dict(save_every=100, diagnostic_every=2)
     agent.epoch_num, agent.last_diagnostic = 0, -1
+    agent.last_final_diagnostic = -1
     seen = []
-    def callback(model, epoch):
+    def callback(model, epoch, *, mean, final):
         seen.append(epoch)
         model.eval()
         random.random(); np.random.random(); torch.rand(3)

@@ -5,7 +5,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import torch
 
-from .hand_reference import WristReference
+from .hand_reference import WristLimitError, WristReference
 from .io import load_artifact, read_json, sha256
 from .mjlab_env import MjlabVecEnv, hand_model
 from .motion import MotionCache, WINDOW_SCHEMA
@@ -13,7 +13,32 @@ from .residual_reward import hand_reward
 from .robot_physics import require_compatibility
 
 
+WRIST_RSI = dict(max_attempts=64, fallback="unperturbed_reference_pose")
+
+
+def sample_wrist_pose(wrist, reference, anchor, rng):
+    """Return a legal pose, rejected-noise count and whether fallback was used."""
+    rotation = Rotation.from_quat(reference[3:7], scalar_first=True)
+    # Validate outside the retry handler: invalid references must still fail.
+    reference_q = wrist.solve(reference[None, :3], rotation.as_matrix()[None], previous=anchor)[0]
+    if rng is None:
+        return reference_q, 0, False
+    for attempt in range(WRIST_RSI["max_attempts"]):
+        position = reference[:3].copy()
+        position += rng.normal(0, .01, 3)
+        axis = rng.random(3)
+        perturbed = Rotation.from_rotvec(axis/np.linalg.norm(axis)*rng.normal(0, np.pi/18))*rotation
+        try:
+            q = wrist.solve(position[None], perturbed.as_matrix()[None], previous=anchor)[0]
+            return q, attempt, False
+        except WristLimitError:
+            pass
+    return reference_q, WRIST_RSI["max_attempts"], True
+
+
 class ImitatorEnv(MjlabVecEnv):
+    wrist_rsi_recipe = WRIST_RSI
+
     def __init__(self, prepared, count, device, seed=42, allow_partial=False):
         self.path, metadata = load_artifact(prepared)
         if metadata["format"] != "maniptrans-h2r-pretrain-v1":
@@ -29,6 +54,7 @@ class ImitatorEnv(MjlabVecEnv):
         self.motion = MotionCache(self.path, read_json(self.path / "motion_manifest.json"), count, self.side, device, seed, allow_partial)
         self.wrist = WristReference(model, robot, self.side)
         self.rng = np.random.default_rng(seed+1)
+        self.wrist_rsi_stats = dict(resets=0, rejected_noise_samples=0, fallbacks=0)
         self.diagnostic = False
         self.fixed_windows = None
         metadata = dict(metadata, scene_sha256=sha256(self.path / "robot_scene.xml"))
@@ -63,18 +89,12 @@ class ImitatorEnv(MjlabVecEnv):
             q[:, 6:] = np.clip(q[:, 6:]+self.rng.normal(size=q[:, 6:].shape)*(upper[6:]-lower[6:])/8, lower[6:], upper[6:])
             dq[:, 6:] = self.rng.normal(0, .1, size=q[:, 6:].shape)
         for i, reference in enumerate(wrist):
-            for attempt in range(8):
-                p, r = reference[:3].copy(), Rotation.from_quat(reference[3:7], scalar_first=True)
-                if not self.diagnostic:
-                    p += self.rng.normal(0, .01, 3)
-                    axis = self.rng.random(3)
-                    r = Rotation.from_rotvec(axis/np.linalg.norm(axis)*self.rng.normal(0, np.pi/18))*r
-                try:
-                    q[i, :6] = self.wrist.solve(p[None], r.as_matrix()[None], previous=anchors[i])[0]
-                    break
-                except ValueError:
-                    if attempt == 7:
-                        raise
+            q[i, :6], rejected, fallback = sample_wrist_pose(
+                self.wrist, reference, anchors[i], None if self.diagnostic else self.rng)
+            if not self.diagnostic:
+                self.wrist_rsi_stats["resets"] += 1
+                self.wrist_rsi_stats["rejected_noise_samples"] += rejected
+                self.wrist_rsi_stats["fallbacks"] += int(fallback)
         v, w = wrist[:, 7:10].copy(), wrist[:, 10:13].copy()
         if not self.diagnostic:
             v += self.rng.normal(0, .01, v.shape)
@@ -89,8 +109,10 @@ class ImitatorEnv(MjlabVecEnv):
         return hand_reward(self.robot, self.side, state, target, power, actions, self.completed_controls, self.scale)
 
     def sampler_state(self):
-        return dict(motion=self.motion.state_dict(), rsi=self.rng.bit_generator.state)
+        return dict(motion=self.motion.state_dict(), rsi=self.rng.bit_generator.state,
+                    wrist_rsi=dict(self.wrist_rsi_stats))
 
     def load_sampler_state(self, state):
         self.motion.load_state_dict(state["motion"])
         self.rng.bit_generator.state = state["rsi"]
+        self.wrist_rsi_stats = dict(state["wrist_rsi"])

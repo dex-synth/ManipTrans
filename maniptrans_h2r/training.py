@@ -19,7 +19,7 @@ from lib.rl.numerics import enable_checks, require_finite
 from .io import digest, load_artifact, read_json, seal, sha256, write_json
 from .policy import parameters, register
 
-TRAINING_REVISION = 5
+TRAINING_REVISION = 6
 
 def training_arguments(parser, stage):
     defaults = yaml.safe_load((Path(__file__).parent / "config" / f"{stage}.yaml").read_text())
@@ -58,6 +58,7 @@ class ReproductionAgent(PPOAgent):
         self.output, self.recipe, self.binding = output, recipe, binding
         self.diagnostic_callback = diagnostic
         self.last_diagnostic = -1
+        self.last_final_diagnostic = -1
         self.restored_best = None
         self.frozen_before = frozen_state(self.model)
 
@@ -80,7 +81,8 @@ class ReproductionAgent(PPOAgent):
             sampler=self.vec_env.sampler_state(), python_rng=random.getstate(), numpy_rng=np.random.get_state(),
             torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all(),
             scheduler=deepcopy(vars(self.scheduler)), last_lr=self.last_lr, entropy_coef=self.entropy_coef,
-            last_diagnostic=self.last_diagnostic, world_state_restarted=True)
+            last_diagnostic=self.last_diagnostic, last_final_diagnostic=self.last_final_diagnostic,
+            world_state_restarted=True)
         return state
 
     def restore_local(self, path):
@@ -103,6 +105,7 @@ class ReproductionAgent(PPOAgent):
         torch.set_rng_state(extra["torch_rng"].cpu())
         torch.cuda.set_rng_state_all([s.cpu() for s in extra["cuda_rng"]])
         self.last_diagnostic = extra["last_diagnostic"]
+        self.last_final_diagnostic = extra["last_final_diagnostic"]
         self.verify_frozen()
 
     def env_reset(self):
@@ -112,18 +115,22 @@ class ReproductionAgent(PPOAgent):
             self.restored_best = None
         return obs
 
-    def diagnostic(self):
-        if self.diagnostic_callback is None or self.last_diagnostic == self.epoch_num:
+    def diagnostic(self, *, final=False):
+        mean = self.last_diagnostic != self.epoch_num
+        final = final and self.last_final_diagnostic != self.epoch_num
+        if self.diagnostic_callback is None or not (mean or final):
             return
         rng = (random.getstate(), np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state_all())
         mode = self.model.training
         try:
-            self.diagnostic_callback(self.model, self.epoch_num)
+            self.diagnostic_callback(self.model, self.epoch_num, mean=mean, final=final)
         finally:
             random.setstate(rng[0]); np.random.set_state(rng[1])
             torch.set_rng_state(rng[2]); torch.cuda.set_rng_state_all(rng[3])
             self.model.train(mode)
         self.last_diagnostic = self.epoch_num
+        if final:
+            self.last_final_diagnostic = self.epoch_num
 
     def update_epoch(self):
         # Parent loop has completed frame/best-reward bookkeeping at this point.
@@ -157,6 +164,8 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
                   training_framework="mjlab", physics_engine="mujoco_warp", training_revision=TRAINING_REVISION, base_sampling="native-resample",
                   native_config_source="main/cfg/config.yaml + task and rl_train stage defaults",
                   budget_source="H2R explicit limits")
+    if args.stage == "imitator":
+        recipe["wrist_rsi"] = dict(env.wrist_rsi_recipe)
     batch = args.worlds*args.horizon
     minibatch = min(1024, batch) if args.small_network else 1024
     if min(args.worlds, args.epochs, args.horizon, args.mini_epochs, args.save_every) < 1 or batch % minibatch or args.diagnostic_every < 0:
@@ -194,7 +203,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         agent.train()
         if not any(not torch.equal(v, dict(agent.model.named_parameters())[k]) for k, v in before.items()):
             raise RuntimeError("No trainable parameter changed")
-        agent.diagnostic()
+        agent.diagnostic(final=True)
         agent.save_product("model")
     except Exception as exc:
         write_json(output / "failure.json", dict(type=type(exc).__name__, error=str(exc), epoch=agent.epoch_num, frame=agent.frame))
@@ -211,7 +220,8 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         frozen_state_unchanged=True, world_state_restarted=bool(args.resume),
         versions={p: importlib.metadata.version(p) for p in ("mjlab", "mujoco", "mujoco-warp", "warp-lang", "torch", "rl-games")}))
     if hasattr(env, "motion"):
-        write_json(output / "sampling.json", dict(visits=env.motion.visits.tolist(), transitions=env.motion.transitions.tolist()))
+        write_json(output / "sampling.json", dict(visits=env.motion.visits.tolist(), transitions=env.motion.transitions.tolist(),
+                                                  wrist_rsi=env.wrist_rsi_stats))
     return saved_params, recipe
 
 
@@ -229,7 +239,7 @@ def train_imitator(args):
     dimensions = {k: s.shape[0] for k, s in env.observation_space.spaces.items()}
     params = parameters(dimensions, dimensions, env.sides, {}, env.action_dim, args.small_network)
     saved, recipe = run_training(env, params, args, output, metadata,
-        diagnostic=diagnostic_callback(prepared, output, args.device, args.allow_incomplete, args.epochs))
+        diagnostic=diagnostic_callback(prepared, output, args.device, args.allow_incomplete))
     for name in ("robot_mapping.json", "compatibility.json", "motion_manifest.json", "diagnostic_manifest.json", "robot_scene.xml"):
         shutil.copy2(prepared / name, output / name)
     shutil.copytree(prepared / "assets", output / "assets")
@@ -258,7 +268,7 @@ def train_residual(args):
         if manifest["format"] != "maniptrans-h2r-imitator-v1" or manifest["side"] != side:
             raise ValueError("Wrong imitator format or hand side")
         if manifest.get("recipe", {}).get("training_revision") != TRAINING_REVISION:
-            raise ValueError("Retrain the base with wrist-feasible windows and the current training revision")
+            raise ValueError("Retrain the base with the current wrist RSI recipe and training revision")
         if manifest["smoke"] and not args.allow_smoke_imitator:
             raise ValueError("Smoke base requires --allow-smoke-imitator")
         if manifest["compatibility"] != metadata["compatibility"][side] or manifest["control"] != CONTROL:

@@ -49,11 +49,13 @@ H2R 明确预算为默认 10000 epochs、4096 worlds；沿用原生 horizon 32�
 
 Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实时间导数、连续腕 Euler 分支及 Jacobian 速度换算在方法侧处理；阶段 1 不做手指 IK。原生奖励与阈值课程保持，课程按控制调用计数，终止保留窗口最后一帧。
 
+阶段 1 的虚拟腕初始化先核验未扰动参考及其 Euler 分支，再按原噪声分布最多尝试 64 次。仅限位越界会触发重采；耗尽后使用已核验的同一参考腕姿态，保留手指和速度初始化规则。参考非法或数值／FK 错误仍立即失败。这是受限虚拟腕的显式初始化适配：回退时取消腕姿态噪声，不等同于原生自由浮动腕的初始化分布。实际配方记录 `wrist_rsi`；`sampling.json` 和 resume sampler 状态保存累计 reset、拒绝样本及回退次数，续训延续计数。
+
 阶段 1 的 `windowing=wrist-feasible-v1` 先在完整连续片段上计算世界姿态、速度和无界腕角，再按限位选择至多2000样本的最长合法窗口。每窗只选择固定等价分支及 `2π` 偏移，不在 episode 内换圈；新分支只在窗口 reset 时生效。全部源转移恰好覆盖一次，世界姿态、速度和时间不因切窗重算。相邻窗口保存各自的边界样本与腕角，用 `source_sample_start` 保留源索引。短末窗在可行时均分，限位强制的短窗保留并计入 `short_window_count`。池内仍按真实转移时长加权。单个转移无法表示或腕平移越界仍报 `robot_reference_invalid`，不删帧或扩大共同限位。
 
 阶段 2 仍为完整任务选择连续腕角，不使用预训练窗口重置任务时钟。RSI 以抽中帧的参考腕角锚定分支；噪声越界时重采，不跳转到另一圈。
 
-部分 corpus 必须显式使用 `--allow-incomplete`。功能检查可加 `--small-network --worlds 8 --epochs 2 --diagnostic-every 0`；即使跳过中间诊断，最终仍做均值和 RSI 随机策略诊断。小网络或部分数据产物标记 `smoke=true`，不能用于默认正式 residual 入口。
+部分 corpus 必须显式使用 `--allow-incomplete`。功能检查可加 `--small-network --worlds 8 --epochs 2 --diagnostic-every 0`；该选项仅关闭周期诊断。实际训练结束时均执行均值和 RSI 随机策略诊断，包括达到 score 或其他原生提前停止条件；最终检查不依赖是否达到 epoch 上限。同一 epoch 已完成的均值诊断不重复执行，最终随机诊断单独去重。小网络或部分数据产物标记 `smoke=true`，不能用于默认正式 residual 入口。
 
 `pretrain check --imitator BASE --prepared PRETRAIN --output CHECK --device cuda:0` 单独执行固定诊断。报告名为 `training-corpus tracking diagnostic`，与训练数据重叠；严格 scale=0.7，报告 wrist、指尖／关节组、功率、有效前缀和时域覆盖。它不是 manipulation SR 或未见序列泛化结果。
 
@@ -138,6 +140,6 @@ Bench 按同一 task/spec 启动 `evaluate-server` 后连接：
 
 旧版显式使用 `prepare --legacy-v1` 与 `train --train-local-imitators`；旧 `virtual-wrist-position-v1` deployment 仍可评估，保留其平滑和时钟。v1 的完整场景 imitator／逐示范训练不作为通用预训练。原生 wrench checkpoint 与两个位置控制版本都不兼容。
 
-当前物理／特征签名仍为 `hand-reference-v3` 和 `maniptrans-hand-physics-v2`，包括具名几何、关节、执行器和封存物理 options；未覆盖的手部 tendon、equality 或显式 contact pair 明确拒绝。阶段 1 prepared 采用 `preparation_revision=2`、`windowing=wrist-feasible-v1`，旧单手参考需重新 prepare。训练采用 `training_revision=5`，两侧 base 需重训，旧 resume 不跨版本续接。阶段 2 的完整任务参考语义未变，满足当前签名和 `preparation_revision=3` 的 residual prepared 可复用。旧封存 deployment 仍可按其原控制契约评估。
+当前物理／特征签名仍为 `hand-reference-v3` 和 `maniptrans-hand-physics-v2`，包括具名几何、关节、执行器和封存物理 options；未覆盖的手部 tendon、equality 或显式 contact pair 明确拒绝。阶段 1 prepared 采用 `preparation_revision=2`、`windowing=wrist-feasible-v1`；满足这些条件的现有全量 prepared 可复用，更旧的单手参考需重新 prepare。训练采用 `training_revision=6`，记录受限腕 RSI 回退配方并保存最终诊断进度；新训练使用本版本的两侧 base，旧 resume 不跨版本续接。阶段 2 的完整任务参考语义未变，满足当前签名和 `preparation_revision=3` 的 residual prepared 可复用。旧封存 deployment 仍可按其原控制契约评估。启动时须明确选择修复后的源码目录；已有运行的冻结 worktree 不会随主 checkout 更新。
 
 本轮短 PPO、真实接触对照与共同评估记录在 bench `runs/checks/maniptrans-native-alignment-20261108/`。短跑不代表全集覆盖、完整预算收敛或论文成绩；其他机器人与未实际运行的批次组合不据此宣称已验证。

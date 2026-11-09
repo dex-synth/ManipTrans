@@ -14,6 +14,10 @@ from .robot import MANO_ORDER
 CONTROL_DT = 1/60
 
 
+class WristLimitError(ValueError):
+    """A wrist pose cannot fit the sealed workspace or anchored joint branch."""
+
+
 def quaternion_signs(quat):
     result = np.asarray(quat, dtype=np.float64).copy()
     result /= np.linalg.norm(result, axis=-1, keepdims=True)
@@ -71,9 +75,9 @@ def continuous_euler(rotations, lower, upper, previous=None):
     if previous is None:
         result = bounded_euler(result, lower, upper)
         if result is None:
-            raise ValueError("robot_reference_invalid: no legal continuous wrist rotation branch")
+            raise WristLimitError("robot_reference_invalid: no legal continuous wrist rotation branch")
     if np.any(result < np.asarray(lower)-1e-7) or np.any(result > np.asarray(upper)+1e-7):
-        raise ValueError("robot_reference_invalid: anchored wrist rotation branch outside limits")
+        raise WristLimitError("robot_reference_invalid: anchored wrist rotation branch outside limits")
     return result
 
 
@@ -137,18 +141,22 @@ class WristReference:
             raise ValueError("Unsupported wrist offset from rotational joint origin")
 
     def solve(self, positions, rotations, previous=None):
+        if not np.isfinite(positions).all() or not np.isfinite(rotations).all():
+            raise ValueError("Non-finite wrist pose")
         translation = self.translation(positions)
         relative = self.parent_rotation.T @ rotations @ self.local_rotation.T
         angles = continuous_euler(relative, self.lower[3:], self.upper[3:], previous)
         result = np.concatenate([translation, angles], axis=1)
+        if not np.isfinite(result).all():
+            raise ValueError("Non-finite wrist pose")
         if np.any(result < self.lower-1e-7) or np.any(result > self.upper+1e-7):
-            raise ValueError("robot_reference_invalid: wrist outside sealed workspace")
+            raise WristLimitError("robot_reference_invalid: wrist outside sealed workspace")
         return result
 
     def translation(self, positions):
         q = np.linalg.solve(self.translation_axes, (positions-self.origin).T).T
         if np.any(q < self.lower[:3]-1e-7) or np.any(q > self.upper[:3]+1e-7):
-            raise ValueError("robot_reference_invalid: wrist outside sealed workspace")
+            raise WristLimitError("robot_reference_invalid: wrist outside sealed workspace")
         return q
 
     def rotations_from_points(self, human):

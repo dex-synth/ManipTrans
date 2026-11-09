@@ -75,12 +75,13 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False):
                 strict_scale=.7, windows=results)
 
 
-def diagnostic_callback(prepared, output, device, allow_partial, final_epoch):
+def diagnostic_callback(prepared, output, device, allow_partial):
     destination = output / "diagnostics"
     destination.mkdir()
-    def callback(model, epoch):
-        write_json(destination / f"epoch-{epoch}.json", tracking(model, prepared, device, allow_partial))
-        if epoch == final_epoch:
+    def callback(model, epoch, *, mean=True, final=False):
+        if mean:
+            write_json(destination / f"epoch-{epoch}.json", tracking(model, prepared, device, allow_partial))
+        if final:
             write_json(destination / "final-rsi-sampled.json", tracking(model, prepared, device, allow_partial, stochastic=True))
     return callback
 
@@ -130,8 +131,9 @@ def residual_tracking(model, prepared, device):
 def residual_diagnostic_callback(prepared, output, device):
     destination = output / "diagnostics"
     destination.mkdir()
-    def callback(model, epoch):
-        write_json(destination / f"epoch-{epoch}.json", residual_tracking(model, prepared, device))
+    def callback(model, epoch, *, mean=True, final=False):
+        if mean:
+            write_json(destination / f"epoch-{epoch}.json", residual_tracking(model, prepared, device))
     return callback
 
 
