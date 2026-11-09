@@ -14,6 +14,22 @@ from .motion import WIDTH, WINDOW_SCHEMA, pack
 from .robot import command_limits, mapping
 from .robot_physics import extract_hand
 
+CLIP_FILTER = dict(min_source_samples=4, min_duration_s=.5, duration_tolerance_s=1e-10)
+
+
+def select_clips(clips):
+    """Apply the imitator's minimum length before interpolation or synthesis."""
+    selected, excluded = [], []
+    for clip in clips:
+        if (clip["num_samples"] < CLIP_FILTER["min_source_samples"] or
+                clip["duration_s"] < CLIP_FILTER["min_duration_s"]-CLIP_FILTER["duration_tolerance_s"]):
+            excluded.append(dict(clip_id=clip["id"], dataset=clip["dataset"], recording=clip["recording"],
+                source_side=clip["source_side"], source_interval=clip["source_interval"],
+                num_samples=clip["num_samples"], duration_s=clip["duration_s"], reason="too_short"))
+        else:
+            selected.append(clip)
+    return selected, excluded
+
 
 def prepare(args):
     import mujoco
@@ -32,6 +48,10 @@ def prepare(args):
     if output.is_relative_to(source) or output.is_relative_to(corpus):
         raise ValueError("Output must be outside its sealed inputs")
     output.mkdir(parents=True, exist_ok=False)
+    clips, excluded = select_clips(clips)
+    write_json(output / "clip_selection.json", dict(rule=CLIP_FILTER, selected_clip_count=len(clips), excluded_clips=excluded))
+    if not clips:
+        raise ValueError("No clips meet the imitator minimum length; see clip_selection.json")
     model = mujoco.MjModel.from_xml_path(str(source / task["scene"]))
     robot = mapping(model, task)
     model, robot, compatibility = extract_hand(source, task, robot, args.side, output)
@@ -106,7 +126,7 @@ def prepare(args):
         compatibility=compatibility, control_dt_s=1/60, physics_dt_s=1/120, source_task_id=task["task_id"],
         preparation_revision=2,
         recipe=dict(seed=args.seed, synthetic_fraction=args.synthetic_fraction, augmentation="interpolated_mano_v1",
-                    windowing=WINDOW_SCHEMA)))
+                    windowing=WINDOW_SCHEMA, clip_filter=CLIP_FILTER)))
     print(f"Prepared generalist reference: {result['id']}")
     return output
 

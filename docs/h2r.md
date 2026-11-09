@@ -25,6 +25,8 @@ uv pip compile --python 3.11 requirements-h2r.txt \
 
 先在 bench 环境运行 `export-hand-motions`，从 ARCTIC、OakInk2、HOT3D、TACO 的全部可用源录制导出共同手部 corpus，不受 manipulation `included` 清单限制。该 corpus 只含来源、MANO 参数、关键点、有效区间与质量记录，不含机器人 IK。
 
+最短训练片段规则由本方法的 `pretrain prepare` 执行：源帧少于 4 帧或时长不足 .5 秒（容差 `1e-10s`）的片段在 MANO 插值及合成前排除。`clip_selection.json` 保存阈值、选中数量和排除片段的来源；这是训练选择，不是参考构造错误，不会因此将完整 corpus 标为 partial。筛选规则同时写入 prepared 的 `recipe.clip_filter`。Bench 新导出保留单帧等短片段，旧 corpus 已在导出时执行过同一筛选，其有效训练片段不变。
+
 共同双手 task 须预先以 `--physics-hz 120 --control-hz 60 --contacts` 封存。旧 task 不会被修改。两侧从相同 task 抽取独立单手模型，移除物体、另一只手和外部接触，只保留相关固定祖先。实际编译后的腕／手指增益、惯量、碰撞及限幅经审计后继承，dampratio 被物化为实际 affine actuator 参数。
 
 ```bash
@@ -95,7 +97,7 @@ episode 的 `completed_controls` 独立于物理 tick／参考 tick，reward 使
 
 | 产物 | 内容 |
 | --- | --- |
-| pretrain prepared | 单手场景、资产、兼容签名、motion mmap、窗口／诊断 manifest |
+| pretrain prepared | 单手场景、资产、兼容签名、片段筛选记录、motion mmap、窗口／诊断 manifest |
 | `imitator.json` | 侧别、数据与物理身份、网络／normalizer、smoke 标识及文件 hash |
 | residual prepared | 原封存 `task/`、`reference.npz`、`rsi.npz/json`、首帧 `initialization.json` |
 | `deployment.json` | 任务身份、相对路径 base、residual checkpoint、动作与特征契约 |
