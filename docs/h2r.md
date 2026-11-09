@@ -1,6 +1,6 @@
 # h2r_bench 接入
 
-`maniptrans_h2r` 实现通用单手 imitator 预训练和逐任务 residual 训练。训练框架为 **mjlab 1.6.0 的公共 `Simulation`**，物理引擎为 MJWarp；控制 60 Hz、物理 120 Hz、decimation=2，默认 4096 个环境。原生 `lib/rl` 的 PPO、网络、normalizer 与奖励函数复用；环境直接组合 `Simulation`，自行管理 reward、RSI 和 terminal，避免引入 ManagerBasedRlEnv 的自动 reset 和 dt 奖励缩放。
+`maniptrans_h2r` 实现通用单手 imitator 预训练和逐任务 residual 训练。训练框架为 **mjlab 1.6.0 的公共 `Simulation`**，物理引擎为 MJWarp；控制 60 Hz、物理 120 Hz、decimation=2，阶段 1 默认每手 8192 个环境，阶段 2 默认 4096 个环境。原生 `lib/rl` 的 PPO、网络、normalizer 与奖励函数复用；环境直接组合 `Simulation`，自行管理 reward、RSI 和 terminal，避免引入 ManagerBasedRlEnv 的自动 reset 和 dt 奖励缩放。
 
 本版本身份为 `maniptrans-mjlab / virtual-wrist-position-v3`。这是保留原生训练主体的共同任务适配：数据集、机器人、simulator 和腕控制均与论文环境不同，不能称为论文结果的精确复现。原生 IsaacGym 入口仍保留。方法代码不导入 bench；bench 独立生成任务、推进评估世界和计分。阶段 1 的上游差异与参数见 [imitator 适配说明](h2r_phase1_imitator_adaptation.md)。
 
@@ -45,7 +45,9 @@ for side in right left; do
 
 `--side both` 共用源姿态重建检查和真实／合成 MANO 解码，再分别镜像及生成左右机器人参考，输出 `OUTPUT/right`、`OUTPUT/left` 两个独立 prepared。`--side right|left` 仍直接输出到 `OUTPUT`。准备阶段使用 CPU；GPU 用于后续训练。CPU 并行数不进入训练配方身份，prepare 的 schema、窗口和失败处理语义保持不变；没有新增依赖。
 
-H2R 明确预算为默认 10000 epochs、4096 worlds；沿用原生 horizon 32、minibatch 1024、mini-epochs 5、seed 42。选定入口为 `main/cfg/config.yaml` 加各阶段 task／rl_train 默认，learning_rate=5e-4、moving_average=1；不混用 README 的 .4/2e-4 override。原生 score_to_win=10000、early_stop_epochs=9999999999999、save_best_after=10（imitator）／2（residual）保留，有限 epoch 预算单独记录停止原因。配置集中在 `config/imitator.yaml`。四数据集等概率、源左右侧等概率，90% 真实／10% MANO 旋转 SLERP 合成；异侧源镜像到目标手。真实序列全长切成至多 2000 帧且共享边界的窗口，按有效秒数抽样，CPU mmap 与每环境 GPU cache 按需取数，不预先把全集搬上显卡。
+阶段 1 默认与上游有效配方对齐：8192 worlds、最大 9999999999999 epochs（全局 `max_iterations`），horizon 32、minibatch 1024、mini-epochs 5、seed 42。选定入口为 `main/cfg/config.yaml` 加 imitator task／rl_train 默认，learning_rate=5e-4、moving_average=1；不混用 README 的 .4/2e-4 override。保留 score_to_win=10000、early_stop_epochs=9999999999999、save_best_after=10；默认 epoch 上限近乎无限，不代表收敛。可用 `--epochs N` 显式限制运行预算，停止原因单独记录。配置集中在 `config/imitator.yaml`。改变 worlds 需要新开训练，不能将旧环境数的 resume 直接续接。
+
+四数据集等概率、源左右侧等概率，90% 真实／10% MANO 旋转 SLERP 合成；异侧源镜像到目标手。真实序列全长切成至多 2000 帧且共享边界的窗口，按有效秒数抽样，CPU mmap 与每环境 GPU cache 按需取数，不预先把全集搬上显卡。
 
 Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实时间导数、连续腕 Euler 分支及 Jacobian 速度换算在方法侧处理；阶段 1 不做手指 IK。原生奖励与阈值课程保持，课程按控制调用计数，终止保留窗口最后一帧。
 

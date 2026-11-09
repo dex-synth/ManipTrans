@@ -59,8 +59,8 @@ RSI 保留 `floor(0.99 × seq_len × U[0,1))`，H2R 再限制到 `length-2`，�
 
 | 参数 | 上游有效默认值 | H2R 默认值 |
 | --- | --- | --- |
-| 并行环境 | 8192 | 每手 4096 |
-| 最大 epochs | 9999999999999（全局覆盖） | 10000 |
+| 并行环境 | 8192 | 每手 8192 |
+| 最大 epochs | 9999999999999（全局覆盖） | 相同 |
 | horizon / minibatch / mini epochs | 32 / 1024 / 5 | 相同 |
 | learning rate / schedule / KL | 5e-4 / adaptive / 0.008 | 相同 |
 | gamma / GAE tau | 0.99 / 0.95 | 相同 |
@@ -72,7 +72,7 @@ RSI 保留 `floor(0.99 × seq_len × U[0,1))`，H2R 再限制到 `length-2`，�
 | score_to_win / early_stop_epochs | 10000 / 9999999999999 | 相同 |
 | save_best_after / 保存周期 | 10 / 1000 epochs | 相同 |
 
-H2R 每手名义预算为 `4096 × 32 × 10000 = 1,310,720,000` 次转移，仍可能触发原生提前停止。上游 PPO YAML 中 `max_epochs=10000`、`early_stop_epochs=500` 是 fallback，不能忽略全局覆盖后直接用于比较。相同 seed 不保证跨后端／随机数实现的逐样本一致。
+H2R 每手每 epoch 采集 `8192 × 32 = 262144` 次转移，执行 `262144 / 1024 × 5 = 1280` 次 minibatch 更新。最大 epoch 沿用上游近乎无限的默认值，仍保留原生停止条件；有限资源预算可通过 `--epochs N` 显式指定。上游 PPO YAML 中 `max_epochs=10000`、`early_stop_epochs=500` 是 fallback，不能忽略全局覆盖后直接用于比较。改变环境数需要新开训练，已有 prepared 可复用；相同 seed 不保证跨后端／随机数实现的逐样本一致。
 
 ## 6. 启动、产物与诊断
 

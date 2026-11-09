@@ -1,8 +1,8 @@
-worlds: 4096
+worlds: 8192
 horizon: 32
 minibatch: 1024
 mini_epochs: 5
-epochs: 10000
+epochs: 9999999999999
 seed: 42
 gamma: 0.99
 tau: 0.95
