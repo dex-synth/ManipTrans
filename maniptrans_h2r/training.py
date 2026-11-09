@@ -16,10 +16,11 @@ from rl_games.common.tr_helpers import DefaultRewardsShaper
 
 from lib.rl.agent import PPOAgent
 from lib.rl.numerics import enable_checks, require_finite
+from .control import CONTROL
 from .io import digest, load_artifact, read_json, seal, sha256, write_json
 from .policy import parameters, register
 
-TRAINING_REVISION = 6
+TRAINING_REVISION = 7
 
 def training_arguments(parser, stage):
     defaults = yaml.safe_load((Path(__file__).parent / "config" / f"{stage}.yaml").read_text())
@@ -162,6 +163,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         recipe[key] = getattr(args, key)
     recipe.update(small_network=args.small_network, partial=prepared_meta.get("partial", False),
                   training_framework="mjlab", physics_engine="mujoco_warp", training_revision=TRAINING_REVISION, base_sampling="native-resample",
+                  control=dict(CONTROL),
                   native_config_source="main/cfg/config.yaml + task and rl_train stage defaults",
                   budget_source="H2R explicit limits")
     if args.stage == "imitator":
@@ -245,7 +247,7 @@ def train_imitator(args):
     shutil.copytree(prepared / "assets", output / "assets")
     seal(output, "imitator.json", dict(format="maniptrans-h2r-imitator-v1", side=metadata["side"],
         prepared_id=metadata["id"], corpus_id=metadata["corpus_id"], compatibility=metadata["compatibility"],
-        control=dict(schema="virtual-wrist-position-v2", moving_average=1., wrist_translation_m=.05, wrist_rotation_rad=.3),
+        control=CONTROL,
         smoke=bool(args.small_network or metadata["partial"]), params=saved, dimensions=dimensions,
         action_dim=env.action_dim, checkpoint="model.pth", recipe=recipe))
     print(f"Generalist imitator: {output}")
@@ -254,7 +256,6 @@ def train_imitator(args):
 def train_residual(args):
     from .residual_env import ResidualEnv
     from .diagnostic import residual_diagnostic_callback
-    from .mjlab_env import CONTROL
     torch.set_num_threads(4)
     seed_all(args.seed)
     prepared, metadata = load_artifact(args.prepared)
@@ -268,7 +269,7 @@ def train_residual(args):
         if manifest["format"] != "maniptrans-h2r-imitator-v1" or manifest["side"] != side:
             raise ValueError("Wrong imitator format or hand side")
         if manifest.get("recipe", {}).get("training_revision") != TRAINING_REVISION:
-            raise ValueError("Retrain the base with the current wrist RSI recipe and training revision")
+            raise ValueError("Retrain the base with the current wrist control and training revision")
         if manifest["smoke"] and not args.allow_smoke_imitator:
             raise ValueError("Smoke base requires --allow-smoke-imitator")
         if manifest["compatibility"] != metadata["compatibility"][side] or manifest["control"] != CONTROL:
@@ -306,7 +307,7 @@ def train_residual(args):
             saved["model"][f"{prefix}_base_model_checkpoint"] = f"{side}-base.pth"
             saved["network"]["base_model"][f"{prefix}_checkpoint"] = f"{side}-base.pth"
     seal(output, "deployment.json", dict(format="maniptrans-h2r-deployment-v2", method="maniptrans-mjlab",
-        controller="virtual-wrist-position-v2", prepared_id=metadata["id"], task_id=metadata["task_id"],
+        controller=CONTROL["schema"], prepared_id=metadata["id"], task_id=metadata["task_id"],
         bundle_id=metadata["bundle_id"], robot_manifest_sha256=metadata["robot_manifest_sha256"],
         compatibility=metadata["compatibility"], params=saved, dimensions=dimensions, action_dim=env.action_dim,
         checkpoint="model.pth", control=CONTROL, residual_mean=True, recipe=recipe,

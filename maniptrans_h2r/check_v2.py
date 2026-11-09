@@ -7,6 +7,7 @@ import torch
 import warp as wp
 
 from .evaluate import Controller
+from .control import PositionControl
 from .io import read_json, write_json
 from .observations import protocol_state
 from .physics import gpu_audit
@@ -19,6 +20,7 @@ def check(args):
     client = Controller(root, args.device)
     env = ResidualEnv(root / 'prepared', 2, args.device, curriculum=False)
     task, robot = env.task, env.robot
+    env.control = PositionControl(robot, 2, args.device, client.manifest['control'])
 
     def initial(*, bench=False):
         env.reset()
@@ -58,7 +60,7 @@ def check(args):
             torch.testing.assert_close(obs[key], value, rtol=1e-3, atol=2e-3)
         commands = client.step(dict(type='frames', done=False, episodes=frames))['commands']
         actions = policy(obs, ['e0', 'e1'])
-        targets = env.control.decode(actions, env.target(1)['robot_q'], env.sides, True)
+        targets = env.control.decode(actions, env.target(1)['robot_q'], env.sides, True, positions=state['robot_q'])
         expected = torch.tensor([[commands[f'e{i}']['joint_targets'][n] for n in robot['joint_names']] for i in range(2)], device=args.device)
         torch.testing.assert_close(targets, expected, rtol=1e-4, atol=2e-5)
         return dict(max_force_error_n=force_errors, max_target_error=float((targets-expected).abs().max()))

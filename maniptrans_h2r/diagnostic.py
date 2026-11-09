@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .control import CONTROL
 from .io import load_artifact, read_json, write_json
 from .policy import Policy, build
 from .residual_reward import hand_inputs
@@ -49,7 +50,8 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False):
                 wrist_velocity_m_s=(bodies[:, 0, 7:10]-wrist[:, 7:10]).norm(dim=-1),
                 wrist_angular_velocity_rad_s=(bodies[:, 0, 10:13]-wrist[:, 10:13]).norm(dim=-1),
                 mean_keypoint_m=points.mean(-1), mean_reward=reward,
-                finger_power_w=goal["power"], wrist_power_w=goal["wrist_power"])
+                finger_power_w=goal["power"], wrist_power_w=goal["wrist_power"],
+                wrist_action_saturation=(actions[:, :6].abs() >= .95).float().mean(-1))
             groups = {name: points[:, [i-1 for i in ids]].mean(-1) for name, ids in weight_indices().items()}
             errors.update({name+"_m": value for name, value in groups.items()})
             for key, values in errors.items():
@@ -139,6 +141,8 @@ def residual_diagnostic_callback(prepared, output, device):
 
 def check_imitator(args):
     root, meta = load_artifact(args.imitator, "imitator.json")
+    if meta.get("control") != CONTROL:
+        raise ValueError("Imitator wrist control differs; use its original checkout or retrain with current control")
     prepared, input_meta = load_artifact(args.prepared)
     if input_meta["id"] != meta["prepared_id"]:
         raise ValueError("Diagnostic corpus/reference differs from the trained imitator")

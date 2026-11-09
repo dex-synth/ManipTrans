@@ -2,7 +2,7 @@
 
 `maniptrans_h2r` 实现通用单手 imitator 预训练和逐任务 residual 训练。训练框架为 **mjlab 1.6.0 的公共 `Simulation`**，物理引擎为 MJWarp；控制 60 Hz、物理 120 Hz、decimation=2，默认 4096 个环境。原生 `lib/rl` 的 PPO、网络、normalizer 与奖励函数复用；环境直接组合 `Simulation`，自行管理 reward、RSI 和 terminal，避免引入 ManagerBasedRlEnv 的自动 reset 和 dt 奖励缩放。
 
-本版本身份为 `maniptrans-mjlab / virtual-wrist-position-v2`。这是保留原生训练方法的共同任务适配：数据集、机器人、simulator 和腕控制均与论文环境不同，不能称为论文结果的精确复现。原生 IsaacGym 入口仍保留。方法代码不导入 bench；bench 独立生成任务、推进评估世界和计分。
+本版本身份为 `maniptrans-mjlab / virtual-wrist-position-v3`。这是保留原生训练主体的共同任务适配：数据集、机器人、simulator 和腕控制均与论文环境不同，不能称为论文结果的精确复现。原生 IsaacGym 入口仍保留。方法代码不导入 bench；bench 独立生成任务、推进评估世界和计分。阶段 1 的上游差异与参数见 [imitator 适配说明](h2r_phase1_imitator_adaptation.md)。
 
 ## 独立环境
 
@@ -57,7 +57,7 @@ Reset 采用原生 `.99` RSI 法则、手指／腕噪声与参考速度。真实
 
 部分 corpus 必须显式使用 `--allow-incomplete`。功能检查可加 `--small-network --worlds 8 --epochs 2 --diagnostic-every 0`；该选项仅关闭周期诊断。实际训练结束时均执行均值和 RSI 随机策略诊断，包括达到 score 或其他原生提前停止条件；最终检查不依赖是否达到 epoch 上限。同一 epoch 已完成的均值诊断不重复执行，最终随机诊断单独去重。小网络或部分数据产物标记 `smoke=true`，不能用于默认正式 residual 入口。
 
-`pretrain check --imitator BASE --prepared PRETRAIN --output CHECK --device cuda:0` 单独执行固定诊断。报告名为 `training-corpus tracking diagnostic`，与训练数据重叠；严格 scale=0.7，报告 wrist、指尖／关节组、功率、有效前缀和时域覆盖。它不是 manipulation SR 或未见序列泛化结果。
+`pretrain check --imitator BASE --prepared PRETRAIN --output CHECK --device cuda:0` 单独执行固定诊断，拒绝与当前控制配方不兼容的 imitator。报告名为 `training-corpus tracking diagnostic`，与训练数据重叠；严格 scale=0.7，报告 wrist、指尖／关节组、功率、有效前缀和时域覆盖。`wrist_action_saturation` 为 soft clamp 后六维腕动作中绝对值至少 .95 的比例，按有效步平均。它不是 manipulation SR 或未见序列泛化结果。
 
 ## 阶段 2：完整任务 residual
 
@@ -89,11 +89,13 @@ Residual 私有训练恢复 `ResDexHand.yaml` 的原生物理课程：重力从 
 动作经原生 soft clamp 后，每手解码为：
 
 ```text
-wrist = reference_wrist(t_next) + scale * (base + 2 * residual)
+wrist = measured_wrist_q(t) + scale * (base + 2 * residual)
 finger = lower + (clamp(base + 2 * residual, -1, 1) + 1) / 2 * (upper - lower)
 ```
 
-平移 scale=.05 m、旋转 scale=.3 rad；阶段 1 没有 residual。v2 moving average=1，无额外平滑；目标再按启用的 actuator ctrlrange 和手指限位裁剪。腕的位置目标由统一物理执行器执行，没有额外 wrench、PID 或物体辅助力。
+平移 scale=.12 m、旋转 scale=1 rad；阶段 1 没有 residual。基准来自控制步开始时的实际关节位置，不累加到上一次目标，也不叠加参考轨迹。每个 60 Hz 控制步计算一次目标，在两个 120 Hz 物理子步内保持，不额外乘 dt。moving average=1，无额外平滑；目标再按启用的 actuator ctrlrange 和手指限位裁剪，腕角不做周期回绕。参考仍用于观测、奖励和 RSI。参数统一定义在 `control.py`，写入训练 recipe 和产物的 `control` 字段。
+
+零腕动作以本步实测位置为目标；运动仍由共同位置执行器产生。该控制让策略主动产生腕运动，但不等同于上游直接施加 wrench：实际作用力依赖共同增益、阻尼及惯量。尺度是位置目标偏置，不是每步实际位移，也不是上游力幅值的等价换算。没有新增参考前馈、速度补偿或物体辅助力。
 
 接触／约束缓冲容量分别在两份 YAML 中固定：单手 128/1024，完整场景 512/2048。容量不足明确报错，不截断接触或自动减少环境数。
 
@@ -138,8 +140,8 @@ Bench 按同一 task/spec 启动 `evaluate-server` 后连接：
 
 `check` 按部署版本选择诊断：v2 检查 masked reset、60 次控制推进 120 ticks、末端单 tick和 nominal 物理；`--run` 使用同任务名义 bench 的真实 `contact_observations.jsonl` 检查初态特征／动作和首区间物理，初始 forward 显式使用 bench reset 的零 ctrl。`--contact-probe` 可读取 bench 同状态探针（task_id、cases 中的 qpos/qvel/ctrl/frame），验证非零手内接触；不再用训练合力伪造物体接触来证明一致性。没有提供 bench 观测时明确记录 parity 未检查。单元测试包含课程原生 helper／reset 调度对照、8/9 与 20/21 门限、完整序列 IK 分块与停止条件；`H2R_NATIVE_RL_SOURCE` 指向只读上游 lib/rl 时，还对照原始 forward 与连续 PPO 更新。
 
-旧版显式使用 `prepare --legacy-v1` 与 `train --train-local-imitators`；旧 `virtual-wrist-position-v1` deployment 仍可评估，保留其平滑和时钟。v1 的完整场景 imitator／逐示范训练不作为通用预训练。原生 wrench checkpoint 与两个位置控制版本都不兼容。
+旧版显式使用 `prepare --legacy-v1` 与 `train --train-local-imitators`；旧 `virtual-wrist-position-v1/v2` deployment 仍按原参考加偏置方式评估，保留各自平滑和时钟。v1 的完整场景 imitator／逐示范训练不作为通用预训练。旧 base 不能用于 v3 residual 训练；旧 imitator 的独立诊断须使用其原 checkout。原生 wrench checkpoint 与位置控制版本均不兼容。
 
-当前物理／特征签名仍为 `hand-reference-v3` 和 `maniptrans-hand-physics-v2`，包括具名几何、关节、执行器和封存物理 options；未覆盖的手部 tendon、equality 或显式 contact pair 明确拒绝。阶段 1 prepared 采用 `preparation_revision=2`、`windowing=wrist-feasible-v1`；满足这些条件的现有全量 prepared 可复用，更旧的单手参考需重新 prepare。训练采用 `training_revision=6`，记录受限腕 RSI 回退配方并保存最终诊断进度；新训练使用本版本的两侧 base，旧 resume 不跨版本续接。阶段 2 的完整任务参考语义未变，满足当前签名和 `preparation_revision=3` 的 residual prepared 可复用。旧封存 deployment 仍可按其原控制契约评估。启动时须明确选择修复后的源码目录；已有运行的冻结 worktree 不会随主 checkout 更新。
+当前物理／特征签名仍为 `hand-reference-v3` 和 `maniptrans-hand-physics-v2`，包括具名几何、关节、执行器和封存物理 options；未覆盖的手部 tendon、equality 或显式 contact pair 明确拒绝。阶段 1 prepared 采用 `preparation_revision=2`、`windowing=wrist-feasible-v1`；满足这些条件的现有全量 prepared 可复用，更旧的单手参考需重新 prepare。prepared 兼容签名中的历史 `control_schema=virtual-wrist-position-v2` 保留为位置执行器契约，策略动作解码由训练产物单独封存。训练采用 `training_revision=7`，绑定 v3 控制配方，同时保留受限腕 RSI 和最终诊断进度；新训练必须重新训练两侧 base，旧 resume 不跨版本续接。阶段 2 的完整任务参考语义未变，满足当前签名和 `preparation_revision=3` 的 residual prepared 可复用。启动时须明确选择当前源码目录；已有运行的冻结 worktree 不会随主 checkout 更新。
 
-本轮短 PPO、真实接触对照与共同评估记录在 bench `runs/checks/maniptrans-native-alignment-20261108/`。短跑不代表全集覆盖、完整预算收敛或论文成绩；其他机器人与未实际运行的批次组合不据此宣称已验证。
+运行验证记录保存在 bench 的 `runs/checks/`，按各记录中的源码版本和控制配方解释结果。短跑不代表全集覆盖、完整预算收敛或论文成绩；其他机器人与未实际运行的批次组合不据此宣称已验证。

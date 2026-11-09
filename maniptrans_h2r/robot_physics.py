@@ -121,6 +121,8 @@ def signature(model, robot, side):
     option_names = (*OPTION_FIELDS, "jacobian", "disableactuator", "noslip_iterations", "noslip_tolerance",
                     "o_margin", "o_solref", "o_solimp", "o_friction", "sdf_initpoints", "sdf_iterations", "sleep_tolerance")
     options = {n: np.asarray(getattr(model.opt, n)).tolist() for n in option_names}
+    # Keep the prepared position-actuator signature stable. Policy decoding is
+    # bound separately by the trained artifact's control recipe.
     return dict(schema=SIGNATURE_SCHEMA, robot_physics_id=digest(fields), physics_options_id=digest(options),
                 physics_dt_s=1/120, control_dt_s=1/60, decimation=2,
                 reference_schema=REFERENCE_SCHEMA, control_schema="virtual-wrist-position-v2",

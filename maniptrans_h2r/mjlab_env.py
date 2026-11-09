@@ -14,12 +14,9 @@ import yaml
 from mjlab.sim import Simulation, SimulationCfg
 from mjlab.sim.sim import MujocoCfg
 
-from .control import PositionControl
+from .control import CONTROL, PositionControl
 from .observations import Features
 from .physics import CAPACITY, OPTION_FIELDS, equal, gpu_audit, sensor_columns
-
-CONTROL = dict(schema="virtual-wrist-position-v2", wrist_translation_m=.05, wrist_rotation_rad=.3, moving_average=1.)
-
 
 def simulation_config(model, stage):
     cfg = MujocoCfg()
@@ -71,7 +68,11 @@ class MjlabVecEnv:
             self.torch_stream = torch.cuda.Stream(device=device)
             self.torch_stream.wait_stream(torch.cuda.current_stream(device))
             torch.cuda.set_stream(self.torch_stream)
-        self.warp_stream = wp.stream_from_torch(self.torch_stream)
+        # Reuse the wrapper: deleting a second wrapper for the same Torch stream
+        # unregisters the live handle in Warp when a diagnostic env is collected.
+        self.warp_stream = wp.get_stream(device)
+        if self.warp_stream.cuda_stream != self.torch_stream.cuda_stream:
+            self.warp_stream = wp.stream_from_torch(self.torch_stream)
         wp.set_stream(self.warp_stream)
         options = {n: np.asarray(getattr(model.opt, n)).copy() for n in OPTION_FIELDS}
         self.sim = Simulation(num_envs=count, cfg=simulation_config(model, stage), model=model, device=device)
@@ -179,7 +180,8 @@ class MjlabVecEnv:
         if self.done.any():
             raise RuntimeError("Call reset_done before stepping completed environments")
         target = self.target(1)
-        commands = self.control.decode(actions, target["robot_q"], self.sides, self.stage == "residual")
+        positions = self.views["qpos"][:, self.robot["qpos_indices"]]
+        commands = self.control.decode(actions, target["robot_q"], self.sides, self.stage == "residual", positions=positions)
         self.views["ctrl"][:, self.robot["actuator_indices"]] = commands[:, self.robot["ctrl_joint_indices"]]
         steps = self.remaining_ticks().clamp(max=2)
         power = torch.zeros_like(commands)

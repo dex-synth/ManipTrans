@@ -98,7 +98,7 @@ class Controller:
         commands = {}
         for row, identity in enumerate(identities):
             positions = self.controls[identity].decode(actions[row:row+1], target["robot_q"][row:row+1],
-                                                       self.robot["sides"], True)[0]
+                                                       self.robot["sides"], True, positions=state["robot_q"][row:row+1])[0]
             commands[identity] = dict(tick=active[row]["tick"], joint_targets=dict(zip(self.robot["joint_names"], positions.tolist())))
             self.next_ticks[identity] = min(active[row]["tick"]+self.task["control_ticks"], self.task["end_tick"])
         return dict(type="step", commands=commands)
