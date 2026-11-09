@@ -15,10 +15,11 @@ from mjlab.sim import Simulation, SimulationCfg
 from mjlab.sim.sim import MujocoCfg
 
 from .control import CONTROL, PositionControl
+from .buffers import capacities, check_overflow
 from .observations import Features
 from .physics import CAPACITY, OPTION_FIELDS, equal, gpu_audit, sensor_columns
 
-def simulation_config(model, stage):
+def simulation_config(model, stage, buffer_capacities=None):
     cfg = MujocoCfg()
     for name in ("timestep", "impratio", "iterations", "tolerance", "ls_iterations", "ls_tolerance", "ccd_iterations"):
         setattr(cfg, name, getattr(model.opt, name))
@@ -31,6 +32,7 @@ def simulation_config(model, stage):
         setattr(cfg, name, value)
     cfg.disableflags, cfg.enableflags = (), ()  # Existing bits stay on the loaded model.
     recipe = yaml.safe_load((Path(__file__).parent / "config" / f"{stage}.yaml").read_text())
+    recipe = capacities(recipe if buffer_capacities is None else buffer_capacities)
     return SimulationCfg(mujoco=cfg, nconmax=recipe["contact_capacity"],
                          njmax=recipe["constraint_capacity"], contact_sensor_maxmatch=CAPACITY+1)
 
@@ -51,7 +53,7 @@ def hand_model(path, robot):
 
 
 class MjlabVecEnv:
-    def __init__(self, model, robot, bodies, pairs, count, device, metadata, stage):
+    def __init__(self, model, robot, bodies, pairs, count, device, metadata, stage, buffer_capacities=None):
         if not str(device).startswith("cuda"):
             raise ValueError("mjlab training requires an explicit CUDA device")
         self.cpu, self.robot, self.bodies, self.pairs = model, robot, bodies, pairs
@@ -75,7 +77,8 @@ class MjlabVecEnv:
             self.warp_stream = wp.stream_from_torch(self.torch_stream)
         wp.set_stream(self.warp_stream)
         options = {n: np.asarray(getattr(model.opt, n)).copy() for n in OPTION_FIELDS}
-        self.sim = Simulation(num_envs=count, cfg=simulation_config(model, stage), model=model, device=device)
+        self.sim = Simulation(num_envs=count, cfg=simulation_config(model, stage, buffer_capacities), model=model, device=device)
+        self.buffer_capacities = dict(contact_capacity=self.sim.cfg.nconmax, constraint_capacity=self.sim.cfg.njmax)
         for n, value in options.items():
             equal(getattr(self.sim.mj_model.opt, n), value, f"mjlab.option.{n}")
         self.model, self.data = self.sim.wp_model, self.sim.wp_data
@@ -161,8 +164,7 @@ class MjlabVecEnv:
             self.reset_states(ids)
             self.views["ctrl"][ids[:, None], torch.as_tensor(self.robot["actuator_indices"], device=self.device)] = self.views["qpos"][ids][:, self.robot["qpos_indices"]][:, self.robot["ctrl_joint_indices"]]
             self.sim.forward()
-            if torch.any(wp.to_torch(self.data.overflow) != 0):
-                raise RuntimeError("MJWarp constraint/contact capacity exceeded during reset")
+            check_overflow(self.data, "reset")
             for k, value in saved.items():
                 self.views[k][unaffected] = value
             contacts = self.contacts()
@@ -190,8 +192,7 @@ class MjlabVecEnv:
             inactive = ~active
             saved = {k: v[inactive].clone() for k, v in self.views.items()}
             self.sim.step()
-            if torch.any(wp.to_torch(self.data.overflow) != 0):
-                raise RuntimeError("MJWarp constraint/contact capacity exceeded")
+            check_overflow(self.data, "step")
             power[active] = (self.views["qfrc_actuator"][:, self.robot["qvel_indices"]]
                              * self.views["qvel"][:, self.robot["qvel_indices"]])[active]
             forces = self.contacts()

@@ -129,7 +129,7 @@ def test_rsi_counters_and_rng_survive_sampler_restore(tmp_path):
 def test_final_diagnostics_run_once_at_actual_stop(tmp_path, monkeypatch, epoch, period, already_diagnosed):
     from maniptrans_h2r import diagnostic
     calls = []
-    def tracking(model, *args, stochastic=False):
+    def tracking(model, *args, stochastic=False, **kwargs):
         model.eval()
         calls.append(stochastic)
         torch.rand(3)
@@ -170,7 +170,7 @@ def test_old_resume_binding_is_rejected_before_loading_state(tmp_path):
 def test_residual_final_callback_does_not_repeat_same_epoch_tracking(tmp_path, monkeypatch):
     from maniptrans_h2r import diagnostic
     calls = []
-    def tracking(*args):
+    def tracking(*args, **kwargs):
         calls.append(1)
         return dict(status='completed')
     monkeypatch.setattr(diagnostic, 'residual_tracking', tracking)

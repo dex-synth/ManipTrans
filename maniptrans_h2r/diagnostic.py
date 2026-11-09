@@ -13,7 +13,7 @@ from .robot import weight_indices
 
 
 @torch.no_grad()
-def tracking(model, prepared, device, allow_partial, *, stochastic=False):
+def tracking(model, prepared, device, allow_partial, *, stochastic=False, buffer_capacities=None):
     from .imitator_env import ImitatorEnv
     torch.manual_seed(43)
     manifest = read_json(prepared / "diagnostic_manifest.json")
@@ -21,7 +21,7 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False):
     if not selected:
         return dict(label=manifest["overlap"], windows=[], count=0)
     count = min(32, len(selected))
-    env = ImitatorEnv(prepared, count, device, seed=43, allow_partial=allow_partial)
+    env = ImitatorEnv(prepared, count, device, seed=43, allow_partial=allow_partial, buffer_capacities=buffer_capacities)
     env.fixed_scale = .7
     env.diagnostic = not stochastic
     model.eval()
@@ -77,19 +77,19 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False):
                 strict_scale=.7, windows=results)
 
 
-def diagnostic_callback(prepared, output, device, allow_partial):
+def diagnostic_callback(prepared, output, device, allow_partial, *, buffer_capacities=None):
     destination = output / "diagnostics"
     destination.mkdir()
     def callback(model, epoch, *, mean=True, final=False):
         if mean:
-            write_json(destination / f"epoch-{epoch}.json", tracking(model, prepared, device, allow_partial))
+            write_json(destination / f"epoch-{epoch}.json", tracking(model, prepared, device, allow_partial, buffer_capacities=buffer_capacities))
         if final:
-            write_json(destination / "final-rsi-sampled.json", tracking(model, prepared, device, allow_partial, stochastic=True))
+            write_json(destination / "final-rsi-sampled.json", tracking(model, prepared, device, allow_partial, stochastic=True, buffer_capacities=buffer_capacities))
     return callback
 
 
 @torch.no_grad()
-def residual_tracking(model, prepared, device):
+def residual_tracking(model, prepared, device, *, buffer_capacities=None):
     """Start at the evaluation pose; report the prefix before strict failure.
 
     This uses a separate nominal training world, not the benchmark evaluator.
@@ -101,7 +101,7 @@ def residual_tracking(model, prepared, device):
     if not initialization["valid"]:
         return dict(report, status="initialization_failed", success=False, coverage=0.,
                     collisions=initialization["collisions"])
-    env = ResidualEnv(prepared, 1, device, seed=43, from_start=True, curriculum=False)
+    env = ResidualEnv(prepared, 1, device, seed=43, from_start=True, curriculum=False, buffer_capacities=buffer_capacities)
     env.fixed_scale = .7
     policy = Policy(model, env.action_dim, {"diagnostic": 43}, device)
     obs = env.observe()
@@ -130,12 +130,12 @@ def residual_tracking(model, prepared, device):
                 mean={k: v/transitions for k, v in sums.items()})
 
 
-def residual_diagnostic_callback(prepared, output, device):
+def residual_diagnostic_callback(prepared, output, device, *, buffer_capacities=None):
     destination = output / "diagnostics"
     destination.mkdir()
     def callback(model, epoch, *, mean=True, final=False):
         if mean:
-            write_json(destination / f"epoch-{epoch}.json", residual_tracking(model, prepared, device))
+            write_json(destination / f"epoch-{epoch}.json", residual_tracking(model, prepared, device, buffer_capacities=buffer_capacities))
     return callback
 
 
@@ -152,4 +152,5 @@ def check_imitator(args):
     model.load_state_dict(torch.load(root / meta["checkpoint"], map_location=args.device, weights_only=True)["model"])
     for stochastic in (False, True):
         write_json(output / ("rsi-sampled.json" if stochastic else "mean-from-start.json"),
-                   tracking(model, prepared, args.device, meta["smoke"], stochastic=stochastic))
+                   tracking(model, prepared, args.device, meta["smoke"], stochastic=stochastic,
+                            buffer_capacities={k: meta["recipe"][k] for k in ("contact_capacity", "constraint_capacity")}))

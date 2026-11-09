@@ -14,7 +14,7 @@ from .robot import initial_qpos
 
 
 class ResidualEnv(MjlabVecEnv):
-    def __init__(self, prepared, count, device, seed=42, *, from_start=False, curriculum=True):
+    def __init__(self, prepared, count, device, seed=42, *, from_start=False, curriculum=True, buffer_capacities=None):
         self.path, metadata = load_artifact(prepared)
         if metadata["format"] != "maniptrans-h2r-prepared-v2":
             raise ValueError("Prepare a v2 task before residual training")
@@ -37,7 +37,7 @@ class ResidualEnv(MjlabVecEnv):
         if from_start and not self.initialization["valid"]:
             raise ValueError("Initial robot pose failed collision admission")
         self.part_indices = [metadata["part_names"].index(p) for p in metadata["scoring_parts"]]
-        super().__init__(model, robot, bodies, pairs, count, device, metadata, "residual")
+        super().__init__(model, robot, bodies, pairs, count, device, metadata, "residual", buffer_capacities)
         self.object_qids = [int(model.joint(n).qposadr[0]) for n in self.task["object"]["joints"].values()]
         self.object_vids = [int(model.joint(n).dofadr[0]) for n in self.task["object"]["joints"].values()]
         if curriculum:

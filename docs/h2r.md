@@ -99,7 +99,7 @@ finger = lower + (clamp(base + 2 * residual, -1, 1) + 1) / 2 * (upper - lower)
 
 零腕动作以本步实测位置为目标；运动仍由共同位置执行器产生。该控制让策略主动产生腕运动，但不等同于上游直接施加 wrench：实际作用力依赖共同增益、阻尼及惯量。尺度是位置目标偏置，不是每步实际位移，也不是上游力幅值的等价换算。没有新增参考前馈、速度补偿或物体辅助力。
 
-接触／约束缓冲容量分别在两份 YAML 中固定：单手 128/1024，完整场景 512/2048。容量不足明确报错，不截断接触或自动减少环境数。
+接触／约束缓冲默认容量在两份 YAML 中配置：单手 128/1024，完整场景 512/2048。训练可用 `--contact-capacity`／`--constraint-capacity` 显式覆盖，训练及周期／最终诊断共用所选容量。MJWarp 接触容量是每 world 的平均分配预算，实际使用跨 world 总池；约束上限按 world 生效。容量不足立即失败，不截断接触或自动减少环境数。错误报告保留 MJWarp overflow 位名、受影响 world 数量、前 16 个 world 的编号／位掩码／约束数，以及实际分配上限；未知位也会报错。训练期间的报告写入 `failure.json` 的 `overflow` 字段，不能仅从通用“容量超限”推断具体缓冲。
 
 episode 的 `completed_controls` 独立于物理 tick／参考 tick，reward 使用当前调用之前的计数：residual 第 8/9 次传 7/8，imitator 第 20/21 次传 19/20；reward 后递增，部分 reset 仅清对应 world。每个控制区间只采样／解码一次动作，调用两次 `Simulation.step()`；任务末端剩一个 physics tick 时仅执行一次。功率使用实际最后一次 solve 的执行力乘该物理步积分后的速度，与原生 reward 和训练计划一致；提前到末端的 world 保留自身最后一步的功率。积分后仅刷新运动学，避免额外 full forward 覆盖接触求解结果。每指接触 sensor 精确匹配该 body 的碰撞 geoms，包含全部接触伙伴；在线状态使用 bench 真实 contact records。新配方要求 `contact_coverage=robot-all-v1`，包含手内与双手接触；schema 相同但覆盖缺失的旧 task 不能用于新训练。
 
@@ -116,6 +116,20 @@ episode 的 `completed_controls` 独立于物理 tick／参考 tick，reward 使
 | `resolved_config.yaml`, `ppo_config.json`, `source.json`, `training.json` | 实际配方、源码 hash、依赖／GPU 版本与训练步数 |
 
 输出目录必须不存在。续训传 `--resume /old/output/resume.pth --output /new/output --epochs TOTAL`，其余影响学习的参数与输入身份保持一致。只在完整 PPO epoch 边界恢复，重新 reset 训练 worlds，记录 `world_state_restarted=true`，不承诺与不中断运行逐位一致。
+
+仅扩容续训需显式加 `--allow-capacity-increase`，允许上述两个容量增加，仍严格校验 prepared／base 身份、环境数、seed、控制、物理和 PPO 配方；不允许减少容量、增删配方字段或跨训练 revision 恢复。既有的 epochs／保存／诊断周期例外保持不变。新 checkpoint 内嵌完整 recipe；旧 checkpoint 须提供原运行的 `--resume-config resolved_config.yaml`，其 recipe hash 必须匹配 checkpoint，不能用修改后的配置代替。恢复记录 `resume.json` 保存 checkpoint hash、原／新 binding、容量差异和恢复 epoch。原生 reward-best `training/imitator/nn/imitator.pth` 也包含完整恢复状态；`model.pth` 和 `epoch-N.pth` 只有模型参数，不可作为 resume。
+
+例如将已确认需要增加的缓冲显式设为 256/2048，并提高保存频率：
+
+```bash
+"$MT_PY" -m maniptrans_h2r.pretrain train \
+  --prepared "$PRETRAIN" --resume "$OLD_BASE/training/imitator/nn/imitator.pth" \
+  --resume-config "$OLD_BASE/resolved_config.yaml" --allow-capacity-increase \
+  --contact-capacity 256 --constraint-capacity 2048 \
+  --save-every 100 --output "$NEW_BASE" --device cuda:0
+```
+
+扩容增加显存需求，不修改名义物理参数或学习算法；具体值需结合 overflow 类型与 GPU 检查选择。碰撞算法或传感器的其他 overflow 不一定能由这两个参数消除。未指定 `--epochs` 时仍沿用原生停止预算。此恢复能力不改变 `training_revision=7` 或既有默认容量；旧运行的源码、配置和 checkpoint 保留原样。
 
 H2R 入口在原生 residual 的 `nan_to_num` 之前检查网络输出和 Gaussian 标准差，并检查梯度、更新后参数、恢复和保存的模型状态。非有限训练结果产生 `failure.json` 并停止，不生成成功 deployment；原生 IsaacGym 默认入口不启用这些检查。
 
