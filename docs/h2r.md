@@ -30,16 +30,20 @@ uv pip compile --python 3.11 requirements-h2r.txt \
 共同双手 task 须预先以 `--physics-hz 120 --control-hz 60 --contacts` 封存。旧 task 不会被修改。两侧从相同 task 抽取独立单手模型，移除物体、另一只手和外部接触，只保留相关固定祖先。实际编译后的腕／手指增益、惯量、碰撞及限幅经审计后继承，dampratio 被物化为实际 affine actuator 参数。
 
 ```bash
+"$MT_PY" -m maniptrans_h2r.pretrain prepare \
+  --corpus /path/to/hand-corpus --task /path/to/sealed-task \
+  --mano-root /path/to/mano/models --side both --workers 8 \
+  --output /path/to/pretrain
 for side in right left; do
-  "$MT_PY" -m maniptrans_h2r.pretrain prepare \
-    --corpus /path/to/hand-corpus --task /path/to/sealed-task \
-    --mano-root /path/to/mano/models --side "$side" \
-    --output "/path/to/pretrain-$side"
   "$MT_PY" -m maniptrans_h2r.pretrain train \
-    --prepared "/path/to/pretrain-$side" --output "/path/to/base-$side" \
+    --prepared "/path/to/pretrain/$side" --output "/path/to/base-$side" \
     --device cuda:0
  done
 ```
+
+准备阶段按片段使用 CPU 多进程，`--workers` 默认 8，可按 CPU 预算调整；每个 worker 的 PyTorch／BLAS 线程数为 1。任务队列最多保留 `2 × workers` 个片段，worker 写临时分片，主进程按源顺序合并并清理，保持窗口顺序和每片段随机种子。MANO hash 每次准备只核验一次，源插值器按片段复用，腕参考按 worker／目标侧复用。
+
+`--side both` 共用源姿态重建检查和真实／合成 MANO 解码，再分别镜像及生成左右机器人参考，输出 `OUTPUT/right`、`OUTPUT/left` 两个独立 prepared。`--side right|left` 仍直接输出到 `OUTPUT`。准备阶段使用 CPU；GPU 用于后续训练。CPU 并行数不进入训练配方身份，prepare 的 schema、窗口和失败处理语义保持不变；没有新增依赖。
 
 H2R 明确预算为默认 10000 epochs、4096 worlds；沿用原生 horizon 32、minibatch 1024、mini-epochs 5、seed 42。选定入口为 `main/cfg/config.yaml` 加各阶段 task／rl_train 默认，learning_rate=5e-4、moving_average=1；不混用 README 的 .4/2e-4 override。原生 score_to_win=10000、early_stop_epochs=9999999999999、save_best_after=10（imitator）／2（residual）保留，有限 epoch 预算单独记录停止原因。配置集中在 `config/imitator.yaml`。四数据集等概率、源左右侧等概率，90% 真实／10% MANO 旋转 SLERP 合成；异侧源镜像到目标手。真实序列全长切成至多 2000 帧且共享边界的窗口，按有效秒数抽样，CPU mmap 与每环境 GPU cache 按需取数，不预先把全集搬上显卡。
 

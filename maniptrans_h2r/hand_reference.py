@@ -39,17 +39,18 @@ def lift_euler(rotations, previous=None):
     result = []
     anchor = np.zeros(3) if previous is None else np.asarray(previous)
     last = anchor.copy()
-    for matrix, angles in zip(rotations, eulers):
+    for angles in eulers:
         bases = [angles, np.array([angles[0]+np.pi, np.pi-angles[1], angles[2]+np.pi])]
         if abs(np.cos(angles[1])) < 1e-7:
             bases.append(np.array([angles[0]-np.sign(angles[1])*last[2], angles[1], last[2]]))
         candidates = np.asarray(bases)
         candidates += 2*np.pi*np.rint((last-candidates)/(2*np.pi))
         last = candidates[np.argmin(np.linalg.norm(candidates-last, axis=1))]
-        if not np.allclose(Rotation.from_euler("XYZ", last).as_matrix(), matrix, atol=1e-5):
-            raise ValueError("Wrist Euler inverse failed FK check")
         result.append(last.copy())
-    return np.asarray(result)
+    result = np.asarray(result)
+    if not np.allclose(Rotation.from_euler("XYZ", result).as_matrix(), rotations, atol=1e-5):
+        raise ValueError("Wrist Euler inverse failed FK check")
+    return result
 
 
 def bounded_euler(path, lower, upper):
@@ -189,10 +190,11 @@ def reference_from_points(model, robot, side, points, times):
     return reference_values(human, q, quat, times, side)
 
 
-def pretraining_reference(model, robot, side, points, times):
+def pretraining_reference(model, robot, side, points, times, *, wrist=None):
     """Compute physical targets/derivatives once, then fit per-episode angles."""
     human = np.asarray(points)[:, MANO_ORDER]
-    wrist = WristReference(model, robot, side)
+    if wrist is None:
+        wrist = WristReference(model, robot, side)
     rotations = wrist.rotations_from_points(human)
     angles = lift_euler(wrist.parent_rotation.T @ rotations @ wrist.local_rotation.T)
     segments = wrist_windows(angles, wrist.lower[3:], wrist.upper[3:])
@@ -252,28 +254,39 @@ def interpolation_times(times, source_times):
     return np.clip(times, lower, upper)
 
 
-def interpolate_motion(arrays, metadata, times, mano_dir, *, endpoints=None, mirror=False):
-    """SLERP absolute MANO rotations, decode, then anchor to the real wrist."""
+class MotionInterpolator:
+    """Reuse source SLERP objects across real and synthetic queries of one clip."""
+
+    def __init__(self, arrays, metadata, mano_dir):
+        self.arrays, self.metadata, self.mano_dir = arrays, metadata, mano_dir
+        self.times = arrays["time_s"]
+        self.positions = arrays["joints_m"][:, 0]
+        quat = np.concatenate([arrays["wrist_quat_wxyz"][:, None], arrays["local_quat_wxyz"]], axis=1)
+        self.rotations = [Slerp(self.times, Rotation.from_quat(quat[:, j], scalar_first=True)) for j in range(16)]
+
+    def __call__(self, times, *, endpoints=None, mirror=False):
+        source_times, positions, rotations = self.times, self.positions, self.rotations
+        if endpoints is not None:
+            endpoints = interpolation_times(endpoints, source_times)
+            positions = np.stack([np.interp(endpoints, source_times, positions[:, j]) for j in range(3)], axis=-1)
+            source_times = np.array([0., endpoints[1]-endpoints[0]])
+            # Keep the original quaternion roundtrip for numerical parity.
+            rotations = [Slerp(source_times, Rotation.from_quat(r(endpoints).as_quat(scalar_first=True), scalar_first=True))
+                         for r in rotations]
+        times = interpolation_times(times, source_times)
+        angles = np.stack([r(times).as_rotvec() for r in rotations], axis=1).reshape(-1, 48)
+        wrist = np.stack([np.interp(times, source_times, positions[:, j]) for j in range(3)], axis=-1)
+        return decode_motion(self.arrays, self.metadata, angles, wrist, self.mano_dir, mirror=mirror)
+
+
+def decode_motion(arrays, metadata, poses, wrist, mano_dir, *, mirror=False):
+    """Decode batched MANO poses and anchor them to the source wrist."""
     import torch
-    source_times = arrays["time_s"]
-    source_quat = np.concatenate([arrays["wrist_quat_wxyz"][:, None], arrays["local_quat_wxyz"]], axis=1)
-    positions = arrays["joints_m"][:, 0]
-    if endpoints is not None:
-        # First query the selected original poses, then interpolate between them.
-        endpoints = interpolation_times(endpoints, source_times)
-        position = np.stack([np.interp(endpoints, source_times, positions[:, j]) for j in range(3)], axis=-1)
-        quat = np.stack([Slerp(source_times, Rotation.from_quat(source_quat[:, j], scalar_first=True))(endpoints).as_quat(scalar_first=True)
-                         for j in range(16)], axis=1)
-        source_times, source_quat, positions = np.array([0., endpoints[1]-endpoints[0]]), quat, position
-    times = interpolation_times(times, source_times)
-    quat = np.stack([Slerp(source_times, Rotation.from_quat(source_quat[:, j], scalar_first=True))(times).as_rotvec()
-                     for j in range(16)], axis=1).reshape(-1, 48)
-    wrist = np.stack([np.interp(times, source_times, positions[:, j]) for j in range(3)], axis=-1)
     model = mano_model(str(mano_dir), metadata["source_side"], metadata["hot3d_shapedirs_fix"])
     result = []
     with torch.inference_mode():
-        for start in range(0, len(times), 256):
-            angles = torch.tensor(quat[start:start+256], dtype=torch.float32)
+        for start in range(0, len(poses), 256):
+            angles = torch.tensor(poses[start:start+256], dtype=torch.float32)
             out = model(global_orient=angles[:, :3], hand_pose=angles[:, 3:],
                         betas=torch.tensor(np.broadcast_to(arrays["betas"], (len(angles), 10)).copy(), dtype=torch.float32))
             joints = torch.cat([out.joints[:, :16], out.vertices[:, metadata["tip_vertex_ids"]]], dim=1)
@@ -282,3 +295,8 @@ def interpolate_motion(arrays, metadata, times, mano_dir, *, endpoints=None, mir
     if mirror:
         result[..., 0] *= -1
     return result.astype(np.float32)
+
+
+def interpolate_motion(arrays, metadata, times, mano_dir, *, endpoints=None, mirror=False):
+    """SLERP absolute MANO rotations, decode, then anchor to the real wrist."""
+    return MotionInterpolator(arrays, metadata, mano_dir)(times, endpoints=endpoints, mirror=mirror)

@@ -1,16 +1,16 @@
 """Prepare, train and diagnose a generalist single-hand ManipTrans imitator."""
 
 import argparse
+from contextlib import ExitStack
 import json
-import math
 from pathlib import Path
 import shutil
 
 import numpy as np
 
-from .hand_reference import interpolate_motion, pretraining_reference
-from .io import check_files, digest, load_arrays, load_artifact, load_task, read_json, seal, sha256, write_json
-from .motion import WIDTH, WINDOW_SCHEMA, pack
+from .io import check_files, digest, load_task, read_json, seal, sha256, write_json
+from .motion import WIDTH, WINDOW_SCHEMA
+from .pretrain_worker import ordered_results, process, worker_pool
 from .robot import command_limits, mapping
 from .robot_physics import extract_hand
 
@@ -35,6 +35,9 @@ def prepare(args):
     import mujoco
     import torch
     torch.set_num_threads(4)
+    workers = getattr(args, "workers", 8)
+    if workers < 1:
+        raise ValueError("--workers must be positive")
     corpus = Path(args.corpus).resolve()
     meta = read_json(corpus / "corpus.json")
     if meta["format"] != "h2r-hand-motion-corpus-v1" or digest({k: v for k, v in meta.items() if k != "id"}) != meta["id"]:
@@ -52,54 +55,55 @@ def prepare(args):
     write_json(output / "clip_selection.json", dict(rule=CLIP_FILTER, selected_clip_count=len(clips), excluded_clips=excluded))
     if not clips:
         raise ValueError("No clips meet the imitator minimum length; see clip_selection.json")
+    mano_hashes = {side: sha256(Path(args.mano_root) / f"MANO_{side.upper()}.pkl") for side in {c["source_side"] for c in clips}}
+    if any(mano_hashes[c["source_side"]] != c["mano_sha256"] for c in clips):
+        raise ValueError("MANO assets differ from exported corpus")
+    sides = ("right", "left") if args.side == "both" else (args.side,)
+    outputs = {side: output / side if args.side == "both" else output for side in sides}
     model = mujoco.MjModel.from_xml_path(str(source / task["scene"]))
     robot = mapping(model, task)
-    model, robot, compatibility = extract_hand(source, task, robot, args.side, output)
-    command_limits(model, robot)
-    write_json(output / "robot_mapping.json", robot)
-    records, errors, offset = [], [], 0
+    states = {}
+    for side, destination in outputs.items():
+        hand_model, hand_robot, compatibility = extract_hand(source, task, robot, side, destination)
+        command_limits(hand_model, hand_robot)
+        write_json(destination / "robot_mapping.json", hand_robot)
+        if destination != output:
+            shutil.copy2(output / "clip_selection.json", destination / "clip_selection.json")
+        (destination / ".parts").mkdir()
+        states[side] = dict(records=[], errors=[], samples=0, compatibility=compatibility)
+    workers = min(workers, len(clips))
+    initargs = (corpus, outputs, args.mano_root, args.seed, args.synthetic_fraction, args.allow_incomplete)
+    try:
+        with ExitStack() as stack:
+            streams = {side: stack.enter_context((path / "motion.raw").open("wb")) for side, path in outputs.items()}
+            executor = stack.enter_context(worker_pool(workers, initargs))
+            results = ordered_results(executor, process, enumerate(clips), 2*workers)
+            for clip, result in zip(clips, results):
+                for side, row in result.items():
+                    state, destination = states[side], outputs[side]
+                    state["errors"].extend(row["errors"])
+                    if row["errors"] and not args.allow_incomplete:
+                        write_json(destination / "reference_errors.json", state["errors"])
+                        raise ValueError(row["errors"][0]["reason"])
+                    with Path(row["path"]).open("rb") as part:
+                        shutil.copyfileobj(part, streams[side], length=1024*1024)
+                    Path(row["path"]).unlink()
+                    for record in row["records"]:
+                        record["offset"] += state["samples"]
+                    state["records"].extend(row["records"])
+                    state["samples"] += row["samples"]
+                    print(f"Prepared {side} {clip['dataset']}/{clip['id'][:12]}: {state['samples']} samples", flush=True)
+    finally:
+        for destination in outputs.values():
+            shutil.rmtree(destination / ".parts")
+    for side, destination in outputs.items():
+        finish_preparation(destination, side, states[side], meta, task, args)
+    return output
+
+
+def finish_preparation(output, side, state, meta, task, args):
+    records, errors, offset = state["records"], state["errors"], state["samples"]
     raw = output / "motion.raw"
-    with raw.open("wb") as stream:
-        for clip in clips:
-            if sha256(Path(args.mano_root) / f"MANO_{clip['source_side'].upper()}.pkl") != clip["mano_sha256"]:
-                raise ValueError("MANO assets differ from exported corpus")
-            arrays = load_arrays(corpus / clip["path"])
-            # Check exact source-pose reconstruction before enabling interpolation/augmentation.
-            reconstructed = interpolate_motion(arrays, clip, arrays["time_s"], args.mano_root)
-            if np.max(np.abs(reconstructed-arrays["joints_m"])) > 1e-5:
-                raise ValueError(f"MANO reconstruction differs: {clip['id']}")
-            duration = float(arrays["time_s"][-1])
-            rng = np.random.default_rng(int(digest([args.seed, clip["id"]])[:16], 16))
-            recipes = [(False, None, duration)]
-            if args.synthetic_fraction:
-                for _ in range(max(1, math.ceil(duration/10))):
-                    start = rng.uniform(0, max(0, duration-.5))
-                    length = rng.uniform(.5, min(5, duration-start))
-                    recipes.append((True, [start, start+length], length))
-            for synthetic, endpoints, length in recipes:
-                times = np.arange(int(np.floor(length*60+1e-9))+1)/60
-                try:
-                    points = interpolate_motion(arrays, clip, times, args.mano_root,
-                                                endpoints=endpoints, mirror=clip["source_side"] != args.side)
-                    reference, segments = pretraining_reference(model, robot, args.side, points, times)
-                    values = pack(reference, args.side)
-                except ValueError as exc:
-                    errors.append(dict(clip_id=clip["id"], dataset=clip["dataset"], source_interval=clip["source_interval"],
-                                       synthetic=synthetic, endpoints=endpoints, reason=str(exc)))
-                    if not args.allow_incomplete:
-                        write_json(output / "reference_errors.json", errors)
-                        raise
-                    continue
-                for start, angles in segments:
-                    count = len(angles)
-                    chunk = values[start:start+count].copy()
-                    chunk[:, -3:] = angles
-                    stream.write(chunk.tobytes())
-                    records.append(dict(offset=offset, length=count, source_sample_start=start, dataset=clip["dataset"],
-                        source_side=clip["source_side"], synthetic=synthetic, clip_id=clip["id"],
-                        recording=clip["recording"], endpoints=endpoints, unused_tail_s=length-times[-1]))
-                    offset += count
-            print(f"Prepared {clip['dataset']}/{clip['id'][:12]}: {offset} samples", flush=True)
     if not offset:
         raise ValueError("No valid robot hand references")
     target = np.lib.format.open_memmap(output / "motion.npy", mode="w+", dtype=np.float32, shape=(offset, WIDTH))
@@ -115,20 +119,19 @@ def prepare(args):
         windowing=WINDOW_SCHEMA, short_window_count=sum(r["length"] < 31 for r in records)))
     diagnostic = []
     for dataset in ("arctic", "oakink2", "hot3d", "taco"):
-        for side in ("left", "right"):
-            choices = sorted((i for i, r in enumerate(records) if not r["synthetic"] and r["dataset"] == dataset and r["source_side"] == side),
+        for source_side in ("left", "right"):
+            choices = sorted((i for i, r in enumerate(records) if not r["synthetic"] and r["dataset"] == dataset and r["source_side"] == source_side),
                              key=lambda i: digest(records[i]))
             indices = np.linspace(0, len(choices)-1, min(32, len(choices)), dtype=int)
             diagnostic.extend(choices[i] for i in indices)
     write_json(output / "diagnostic_manifest.json", dict(windows=diagnostic, overlap="training-corpus tracking diagnostic"))
-    result = seal(output, "prepared.json", dict(format="maniptrans-h2r-pretrain-v1", side=args.side,
+    result = seal(output, "prepared.json", dict(format="maniptrans-h2r-pretrain-v1", side=side,
         corpus_id=meta["id"], partial=bool(not meta["inventory_complete"] or errors),
-        compatibility=compatibility, control_dt_s=1/60, physics_dt_s=1/120, source_task_id=task["task_id"],
+        compatibility=state["compatibility"], control_dt_s=1/60, physics_dt_s=1/120, source_task_id=task["task_id"],
         preparation_revision=2,
         recipe=dict(seed=args.seed, synthetic_fraction=args.synthetic_fraction, augmentation="interpolated_mano_v1",
                     windowing=WINDOW_SCHEMA, clip_filter=CLIP_FILTER)))
     print(f"Prepared generalist reference: {result['id']}")
-    return output
 
 
 def main():
@@ -137,7 +140,9 @@ def main():
     prep = sub.add_parser("prepare")
     prep.add_argument("--corpus", required=True)
     prep.add_argument("--task", required=True)
-    prep.add_argument("--side", choices=("left", "right"), required=True)
+    prep.add_argument("--side", choices=("left", "right", "both"), required=True,
+                      help="both shares human decoding and writes OUTPUT/right and OUTPUT/left")
+    prep.add_argument("--workers", type=int, default=8, help="Clip worker processes, each with one numerical thread (default: 8)")
     prep.add_argument("--mano-root", required=True)
     prep.add_argument("--output", required=True)
     prep.add_argument("--synthetic-fraction", type=float, default=.1)
