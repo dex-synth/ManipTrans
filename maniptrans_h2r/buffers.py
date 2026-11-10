@@ -16,8 +16,10 @@ def capacities(recipe):
 
 
 class SimulationOverflow(RuntimeError):
-    def __init__(self, report):
+    def __init__(self, report, world_ids=None):
         self.report = report
+        # The JSON report is bounded; recovery must use every affected world.
+        self.world_ids = world_ids
         super().__init__(f"MJWarp overflow during {report['phase']}: {report['flags']}; "
                          f"{report['world_count']} affected worlds; limits={report['limits']}")
 
@@ -41,4 +43,4 @@ def check_overflow(data, phase):
         nefc=nefc[sample.to(nefc.device)].cpu().tolist(),
         contacts_total=int(wp.to_torch(data.nacon).sum()),
         limits=dict(contacts_total=data.naconmax, constraints_per_world=data.njmax,
-                    ccd_total=data.naccdmax, jacobian_nonzeros=data.njmax_nnz)))
+                    ccd_total=data.naccdmax, jacobian_nonzeros=data.njmax_nnz)), ids)

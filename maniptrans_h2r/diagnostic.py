@@ -10,10 +10,11 @@ from .io import load_artifact, read_json, write_json
 from .policy import Policy, build
 from .residual_reward import hand_inputs
 from .robot import weight_indices
+from .recovery import EpaRecovery
 
 
 @torch.no_grad()
-def tracking(model, prepared, device, allow_partial, *, stochastic=False, buffer_capacities=None):
+def tracking(model, prepared, device, allow_partial, *, stochastic=False, buffer_capacities=None, epa_recovery=None):
     from .imitator_env import ImitatorEnv
     torch.manual_seed(43)
     manifest = read_json(prepared / "diagnostic_manifest.json")
@@ -21,7 +22,8 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False, buffer
     if not selected:
         return dict(label=manifest["overlap"], windows=[], count=0)
     count = min(32, len(selected))
-    env = ImitatorEnv(prepared, count, device, seed=43, allow_partial=allow_partial, buffer_capacities=buffer_capacities)
+    env = ImitatorEnv(prepared, count, device, seed=43, allow_partial=allow_partial,
+                      buffer_capacities=buffer_capacities, epa_recovery=epa_recovery)
     env.fixed_scale = .7
     env.diagnostic = not stochastic
     model.eval()
@@ -54,9 +56,10 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False, buffer
                 wrist_action_saturation=(actions[:, :6].abs() >= .95).float().mean(-1))
             groups = {name: points[:, [i-1 for i in ids]].mean(-1) for name, ids in weight_indices().items()}
             errors.update({name+"_m": value for name, value in groups.items()})
+            valid = active & ~info["simulation_errors"]
             for key, values in errors.items():
-                sums.setdefault(key, torch.zeros(count, device=device))[active] += values[active]
-            samples[active] += 1
+                sums.setdefault(key, torch.zeros(count, device=device))[valid] += values[valid]
+            samples[valid] += 1
             for row in (active & done).nonzero().flatten().tolist():
                 window = env.motion.windows[group[row]]
                 thresholds = dict(thumb_tip=.04, index_tip=.045, middle_tip=.05, ring_tip=.06,
@@ -68,8 +71,10 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False, buffer
                     start_sample=int(start_positions[row]),
                     coverage=float(samples[row]/(window["length"]-1)),
                     remaining_coverage=float(samples[row]/(window["length"]-1-start_positions[row])),
-                    failure_reasons=(reasons or ["native_velocity_sanity"]) if env.failure_buf[row] else [],
-                    **{k: float(v[row]/samples[row]) for k, v in sums.items()}))
+                    simulation_error=bool(info["simulation_errors"][row]),
+                    failure_reasons=(["EPA_HORIZON"] if info["simulation_errors"][row] else
+                                     (reasons or ["native_velocity_sanity"]) if env.failure_buf[row] else []),
+                    **{k: float(v[row]/samples[row]) if samples[row] else None for k, v in sums.items()}))
             active &= ~done
             if active.any():
                 obs = env.reset_done()[0]
@@ -77,14 +82,18 @@ def tracking(model, prepared, device, allow_partial, *, stochastic=False, buffer
                 strict_scale=.7, windows=results)
 
 
-def diagnostic_callback(prepared, output, device, allow_partial, *, buffer_capacities=None):
+def diagnostic_callback(prepared, output, device, allow_partial, *, buffer_capacities=None, recover_epa=False):
     destination = output / "diagnostics"
     destination.mkdir()
     def callback(model, epoch, *, mean=True, final=False):
         if mean:
-            write_json(destination / f"epoch-{epoch}.json", tracking(model, prepared, device, allow_partial, buffer_capacities=buffer_capacities))
+            recovery = EpaRecovery(destination / f"epoch-{epoch}-epa") if recover_epa else None
+            write_json(destination / f"epoch-{epoch}.json", tracking(model, prepared, device, allow_partial,
+                       buffer_capacities=buffer_capacities, epa_recovery=recovery))
         if final:
-            write_json(destination / "final-rsi-sampled.json", tracking(model, prepared, device, allow_partial, stochastic=True, buffer_capacities=buffer_capacities))
+            recovery = EpaRecovery(destination / "final-rsi-sampled-epa") if recover_epa else None
+            write_json(destination / "final-rsi-sampled.json", tracking(model, prepared, device, allow_partial,
+                       stochastic=True, buffer_capacities=buffer_capacities, epa_recovery=recovery))
     return callback
 
 
@@ -151,6 +160,9 @@ def check_imitator(args):
     model = build(meta["params"], meta["dimensions"], meta["action_dim"], args.device)
     model.load_state_dict(torch.load(root / meta["checkpoint"], map_location=args.device, weights_only=True)["model"])
     for stochastic in (False, True):
+        name = "rsi-sampled" if stochastic else "mean-from-start"
+        recovery = EpaRecovery(output / f"{name}-epa") if meta["recipe"].get("epa_recovery") else None
         write_json(output / ("rsi-sampled.json" if stochastic else "mean-from-start.json"),
                    tracking(model, prepared, args.device, meta["smoke"], stochastic=stochastic,
-                            buffer_capacities={k: meta["recipe"][k] for k in ("contact_capacity", "constraint_capacity")}))
+                            buffer_capacities={k: meta["recipe"][k] for k in ("contact_capacity", "constraint_capacity")},
+                            epa_recovery=recovery))

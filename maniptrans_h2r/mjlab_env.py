@@ -15,7 +15,8 @@ from mjlab.sim import Simulation, SimulationCfg
 from mjlab.sim.sim import MujocoCfg
 
 from .control import CONTROL, PositionControl
-from .buffers import capacities, check_overflow
+from .buffers import SimulationOverflow, capacities, check_overflow
+from .recovery import STATE_KEYS
 from .observations import Features
 from .physics import CAPACITY, OPTION_FIELDS, equal, gpu_audit, sensor_columns
 
@@ -60,6 +61,7 @@ class MjlabVecEnv:
         self.count, self.device, self.metadata, self.stage = count, device, metadata, stage
         self.sides = robot["sides"]
         self.env = self
+        self.epa_recovery = getattr(self, "epa_recovery", None)
         self.control_dt_s, self.decimation = 1/60, 2
         torch.cuda.set_device(device)
         wp.init()
@@ -187,12 +189,28 @@ class MjlabVecEnv:
         self.views["ctrl"][:, self.robot["actuator_indices"]] = commands[:, self.robot["ctrl_joint_indices"]]
         steps = self.remaining_ticks().clamp(max=2)
         power = torch.zeros_like(commands)
+        invalid = torch.zeros(self.count, dtype=torch.bool, device=self.device)
+        recovering = False
+        recovery = getattr(self, "epa_recovery", None)
         for substep in range(int(steps.max())):
             active = steps > substep
             inactive = ~active
             saved = {k: v[inactive].clone() for k, v in self.views.items()}
+            before = {k: self.views[k].clone() for k in STATE_KEYS} if recovery else None
             self.sim.step()
-            check_overflow(self.data, "step")
+            try:
+                check_overflow(self.data, "step")
+            except SimulationOverflow as error:
+                if recovery is None:
+                    raise
+                ids = recovery.handle(self, error, before, invalid, substep)
+                invalid[ids] = True
+                recovering = True
+            if recovering:
+                # Quarantine the failed rows until the normal episode reset. Other
+                # worlds still complete both physics substeps on their original clock.
+                for k, values in before.items():
+                    self.views[k][invalid] = values[invalid]
             power[active] = (self.views["qfrc_actuator"][:, self.robot["qvel_indices"]]
                              * self.views["qvel"][:, self.robot["qvel_indices"]])[active]
             forces = self.contacts()
@@ -218,8 +236,16 @@ class MjlabVecEnv:
         self.done = failure | at_end
         self.success_buf, self.failure_buf = (at_end & ~failure).float(), failure.float()
         details["scale_factor"] = torch.full_like(reward, self.scale)
+        if recovering:
+            self.done |= invalid
+            self.success_buf[invalid] = 0
+            self.failure_buf[invalid] = 0
+            reward[invalid] = 0
+            for value in details.values():
+                value[invalid] = 0
         obs = self.features(state, self.target(1), self.sides, self.stage)
-        return obs, reward, self.done, dict(reward_dict=details, error_masks=torch.ones_like(reward), time_outs=torch.zeros_like(self.done))
+        return obs, reward, self.done, dict(reward_dict=details, error_masks=(~invalid).float(),
+            simulation_errors=invalid, time_outs=torch.zeros_like(self.done))
 
     def advance_reference(self):
         pass

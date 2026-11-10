@@ -34,7 +34,7 @@ Upstream 参数取 `main/cfg/config.yaml`、`DexHandImitator.yaml` 和 `DexHandI
 | 手指动作 | soft clamp 后映射到手指关节范围 | 保留映射，另遵守启用的 actuator ctrl range |
 | 重力与场景 | 原生 imitator 场景，手部 `disable_gravity=True` | 沿用共同 task 的重力和手部 gravcomp；抽取单手时移除物体、桌面和另一只手 |
 | 域随机化 | imitator 默认 `randomize=False` | Phase 1 不启用域随机化 |
-| 接触容量 | PhysX `max_gpu_contact_pairs=1048576`，为全局配置 | 单手每环境 contact / constraint capacity=128 / 1024；溢出报错，两者计数口径不同 |
+| 接触容量 | PhysX `max_gpu_contact_pairs=1048576`，为全局配置 | 单手每环境 contact / constraint capacity=128 / 1024；默认溢出报错，两者计数口径不同；显式 `--recover-epa` 可对纯局部 EPA 故障截断 episode 并屏蔽无效 PPO transition，属于故障处理适配，详见 [恢复语义](h2r.md) |
 | 基础观测 | 手指 q、cos(q)、sin(q)、dq、腕状态及人体目标位置／速度差 | 保留这些特征；privileged 追加腕 dq，proprioception 追加腕 q，target 追加下一帧参考腕 q |
 | 动作／观测维度 | 随原生机器人变化；默认腕动作 6 维，加手指 DOF | Sharpa 动作 28 维（22 手指 + 6 腕）；privileged / proprioception / target 为 28 / 85 / 209 维 |
 | 观测裁剪 | ±5 | ±5 |

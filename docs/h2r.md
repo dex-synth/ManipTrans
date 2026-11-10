@@ -99,7 +99,7 @@ finger = lower + (clamp(base + 2 * residual, -1, 1) + 1) / 2 * (upper - lower)
 
 零腕动作以本步实测位置为目标；运动仍由共同位置执行器产生。该控制让策略主动产生腕运动，但不等同于上游直接施加 wrench：实际作用力依赖共同增益、阻尼及惯量。尺度是位置目标偏置，不是每步实际位移，也不是上游力幅值的等价换算。没有新增参考前馈、速度补偿或物体辅助力。
 
-接触／约束缓冲默认容量在两份 YAML 中配置：单手 128/1024，完整场景 512/2048。训练可用 `--contact-capacity`／`--constraint-capacity` 显式覆盖，训练及周期／最终诊断共用所选容量。MJWarp 接触容量是每 world 的平均分配预算，实际使用跨 world 总池；约束上限按 world 生效。容量不足立即失败，不截断接触或自动减少环境数。错误报告保留 MJWarp overflow 位名、受影响 world 数量、前 16 个 world 的编号／位掩码／约束数，以及实际分配上限；未知位也会报错。训练期间的报告写入 `failure.json` 的 `overflow` 字段，不能仅从通用“容量超限”推断具体缓冲。
+接触／约束缓冲默认容量在两份 YAML 中配置：单手 128/1024，完整场景 512/2048。训练可用 `--contact-capacity`／`--constraint-capacity` 显式覆盖，训练及周期／最终诊断共用所选容量。MJWarp 接触容量是每 world 的平均分配预算，实际使用跨 world 总池；约束上限按 world 生效。默认任何 overflow 立即失败，不截断接触或自动减少环境数；阶段 1 可显式启用下述局部 EPA 恢复。错误报告保留 MJWarp overflow 位名、受影响 world 数量、前 16 个 world 的编号／位掩码／约束数，以及实际分配上限；未知位也会报错。训练期间的报告写入 `failure.json` 的 `overflow` 字段，不能仅从通用“容量超限”推断具体缓冲。
 
 episode 的 `completed_controls` 独立于物理 tick／参考 tick，reward 使用当前调用之前的计数：residual 第 8/9 次传 7/8，imitator 第 20/21 次传 19/20；reward 后递增，部分 reset 仅清对应 world。每个控制区间只采样／解码一次动作，调用两次 `Simulation.step()`；任务末端剩一个 physics tick 时仅执行一次。功率使用实际最后一次 solve 的执行力乘该物理步积分后的速度，与原生 reward 和训练计划一致；提前到末端的 world 保留自身最后一步的功率。积分后仅刷新运动学，避免额外 full forward 覆盖接触求解结果。每指接触 sensor 精确匹配该 body 的碰撞 geoms，包含全部接触伙伴；在线状态使用 bench 真实 contact records。新配方要求 `contact_coverage=robot-all-v1`，包含手内与双手接触；schema 相同但覆盖缺失的旧 task 不能用于新训练。
 
@@ -130,6 +130,14 @@ episode 的 `completed_controls` 独立于物理 tick／参考 tick，reward 使
 ```
 
 扩容增加显存需求，不修改名义物理参数或学习算法；具体值需结合 overflow 类型与 GPU 检查选择。碰撞算法或传感器的其他 overflow 不一定能由这两个参数消除。未指定 `--epochs` 时仍沿用原生停止预算。此恢复能力不改变 `training_revision=7` 或既有默认容量；旧运行的源码、配置和 checkpoint 保留原样。
+
+阶段 1 的 `--recover-epa` 启用 `epa-episode-skip-v1`。仅物理 step 中的纯 `EPA_HORIZON` 可恢复：恢复该 world 的子步前状态、隔离剩余子步，结束当前 episode，下次按原采样规则 reset；其他 worlds 完成原定物理步数。故障 transition 从 PPO loss、KL、输入／value 归一化统计中剔除，GAE 在该处截断，故障前最后一条有效 transition 从有效的故障前状态 value bootstrap。仿真截断不进入训练游戏成功／失败及奖励均值；此前有效轨迹仍可用于学习。这是显式的仿真故障处理适配，会改变遇到故障后的采样分布，不宣称等价于原生无故障训练，也不提高 EPA 容量。
+
+恢复策略同时绑定固定保护阈值：一次控制步最多影响 `max(1, floor(worlds*0.001))` 个 worlds（8192 环境时为 8）；滚动 1000 个控制步内最多跳过 32 个 episodes。同一 world 在同一控制步的两个子步报错只计一个 episode。超过阈值、reset／初始化溢出、混合或未知 overflow、非有限状态和 CUDA 异常仍失败。阶段 2 和 bench 评估不启用该恢复。
+
+`epa-recovery/events.jsonl` 记录完整受影响 world 列表、控制步、参考 window／clip／sample 和错误；对应 `event-N.pth` 保存子步前 `qpos/qvel/act/ctrl/time/qacc_warmstart`，`summary.json` 记录累计次数和滚动窗口。恢复计数随完整 checkpoint 续接。`frame/transitions` 仍是尝试的转移数，实际跳过数单独记录，不能将其当作有效训练样本。方法侧固定诊断也记录 EPA 截断，保留原窗口分母并按失败报告，有效覆盖不含故障步；这些诊断不是 bench 指标。
+
+从未启用恢复的 revision 7 checkpoint 续接时，`--recover-epa` 同时明确授权加入这一个版本化策略；旧 recipe hash、prepared／base 和其他配方仍严格核验，额外扩容仍需 `--allow-capacity-increase`。`resolved_config.yaml` 绑定 `epa_recovery`，`resume.json` 记录 `recovery_changes`。已启用恢复的 checkpoint 须保持同一策略，不能静默关闭或修改阈值。例如在保留原运行参数的续训命令上增加 `--recover-epa`，并使用新的输出目录；默认原生停止条件不变。
 
 H2R 入口在原生 residual 的 `nan_to_num` 之前检查网络输出和 Gaussian 标准差，并检查梯度、更新后参数、恢复和保存的模型状态。非有限训练结果产生 `failure.json` 并停止，不生成成功 deployment；原生 IsaacGym 默认入口不启用这些检查。
 

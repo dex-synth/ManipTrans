@@ -3,6 +3,15 @@
 import torch
 
 
+def normalize_valid(normalizer, values, valid):
+    """Update moments using valid rows only, then normalize the fixed-size batch."""
+    if int(valid.sum()) > 1:
+        normalizer.train()
+        normalizer(values[valid])
+    normalizer.eval()
+    return normalizer(values)
+
+
 def require_finite(values, context):
     values = {name: value for name, value in values.items() if value is not None}
     if not values:

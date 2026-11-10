@@ -24,6 +24,7 @@ from scipy.stats import linregress
 
 
 from rl_games.common import common_losses
+from lib.rl.numerics import normalize_valid
 
 
 def swap_and_flatten01(arr):
@@ -929,6 +930,9 @@ class MyA2CBase(BaseAlgorithm):
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             env_done_indices = all_done_indices[:: self.num_agents]
+            if "simulation_errors" in infos:
+                # Simulator truncations reset episode counters but are not scored games.
+                env_done_indices = env_done_indices[~infos["simulation_errors"][env_done_indices].flatten()]
 
             if "total_rewards" in infos:
                 self.current_rewards = torch.max(self.current_rewards, infos["total_rewards"][:, None])  # ! trick
@@ -1230,11 +1234,18 @@ class MyContinuousA2CBase(MyA2CBase):
 
         advantages = returns - values
 
-        if self.normalize_value:  # ! TODO: should mask the error values
-            self.value_mean_std.train()
-            values = self.value_mean_std(values)
-            returns = self.value_mean_std(returns)
-            self.value_mean_std.eval()
+        if self.normalize_value:
+            if self.config.get("truncate_invalid_transitions", False) and not error_masks.bool().all():
+                valid = error_masks.bool()
+                if not valid.any():
+                    raise RuntimeError("No valid physics transitions in PPO rollout")
+                values = normalize_valid(self.value_mean_std, values, valid)
+                returns = normalize_valid(self.value_mean_std, returns, valid)
+            else:
+                self.value_mean_std.train()
+                values = self.value_mean_std(values)
+                returns = self.value_mean_std(returns)
+                self.value_mean_std.eval()
 
         advantages = torch.sum(advantages, axis=1)
 

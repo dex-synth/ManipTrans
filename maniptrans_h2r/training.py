@@ -20,6 +20,7 @@ from .buffers import CAPACITY_KEYS, SimulationOverflow, capacities
 from .control import CONTROL
 from .io import digest, load_artifact, read_json, seal, sha256, write_json
 from .policy import parameters, register
+from .recovery import EPA_RECOVERY, EpaRecovery
 
 TRAINING_REVISION = 7
 
@@ -41,6 +42,9 @@ def training_arguments(parser, stage):
                         help="Allow only increased contact/constraint buffers when resuming")
     parser.add_argument("--resume-config", type=Path,
                         help="Original resolved_config.yaml for a legacy checkpoint without an embedded recipe")
+    if stage == "imitator":
+        parser.add_argument("--recover-epa", action="store_true",
+                            help="Opt in to bounded EPA episode skips, including when resuming a strict run")
     if stage == "residual":
         parser.add_argument("--imitator-right")
         parser.add_argument("--imitator-left")
@@ -86,6 +90,26 @@ def capacity_resume_changes(old_binding, binding, old_recipe, recipe):
     return {k: dict(before=before[k], after=after[k]) for k in sorted(changed)}
 
 
+def recovery_resume_changes(old_binding, binding, old_recipe, recipe, allow_capacity_increase=False):
+    """Authenticate the strict run before adding this one versioned recovery policy."""
+    if digest(recipe_identity(recipe)) != binding["recipe_id"]:
+        raise ValueError("Current resume recipe hash differs")
+    if old_recipe is None or "epa_recovery" in old_recipe or recipe.get("epa_recovery") != EPA_RECOVERY:
+        raise ValueError("EPA resume requires an original strict recipe and the supported recovery policy")
+    strict_recipe = {k: v for k, v in recipe.items() if k != "epa_recovery"}
+    strict_binding = dict(binding, recipe_id=digest(recipe_identity(strict_recipe)))
+    changes = capacity_resume_changes(old_binding, strict_binding, old_recipe, strict_recipe)
+    if changes and not allow_capacity_increase:
+        raise ValueError("Capacity changes also require --allow-capacity-increase")
+    return changes
+
+
+def select_rows(value, valid):
+    if isinstance(value, dict):
+        return {k: select_rows(v, valid) for k, v in value.items()}
+    return value[valid] if isinstance(value, torch.Tensor) else value
+
+
 class ReproductionAgent(PPOAgent):
     def __init__(self, params, output, recipe, binding, diagnostic=None):
         super().__init__("run", params)
@@ -98,6 +122,38 @@ class ReproductionAgent(PPOAgent):
         self.last_final_diagnostic = -1
         self.restored_best = None
         self.frozen_before = frozen_state(self.model)
+        if recipe.get("epa_recovery") and (self.is_rnn or self.has_central_value or self.num_agents != 1):
+            raise ValueError("EPA recovery supports only the single-agent feedforward imitator")
+
+    def discount_values(self, fdones, last_values, dones, values, rewards):
+        if self.recipe.get("epa_recovery"):
+            # A failed transition contributes no delta/GAE. Its predecessor still
+            # bootstraps from the valid pre-failure V(s), never from the next reset.
+            masks = self.experience_buffer.tensor_dict["error_masks"]
+            return self.discount_values_masks(fdones, last_values, dones, values, rewards, masks)
+        return super().discount_values(fdones, last_values, dones, values, rewards)
+
+    def train_actor_critic(self, batch):
+        if not self.recipe.get("epa_recovery") or batch["error_masks"].bool().all():
+            return super().train_actor_critic(batch)
+        valid = batch["error_masks"].bool()
+        mu, sigma = batch["mu"].clone(), batch["sigma"].clone()
+        if not valid.any():
+            zero = torch.zeros((), device=self.ppo_device)
+            return zero, zero, zero, zero, self.last_lr, 1., mu, sigma, zero
+        # Remove bad rows before forward so input normalization, KL and all losses
+        # use only valid transitions. Keep the dataset's original indexing.
+        normalizer = self.model.running_mean_std
+        training = normalizer.training
+        if int(valid.sum()) == 1:
+            normalizer.eval()  # Sample variance is undefined for a singleton.
+        try:
+            result = list(super().train_actor_critic(select_rows(batch, valid)))
+        finally:
+            normalizer.train(training)
+        mu[valid], sigma[valid] = result[6], result[7]
+        result[6], result[7] = mu, sigma
+        return tuple(result)
 
     def trancate_gradients_and_step(self):
         require_finite({n: p.grad for n, p in self.model.named_parameters()}, "gradients")
@@ -120,9 +176,11 @@ class ReproductionAgent(PPOAgent):
             scheduler=deepcopy(vars(self.scheduler)), last_lr=self.last_lr, entropy_coef=self.entropy_coef,
             last_diagnostic=self.last_diagnostic, last_final_diagnostic=self.last_final_diagnostic,
             world_state_restarted=True)
+        if self.vec_env.epa_recovery is not None:
+            state["h2r"]["epa_recovery"] = self.vec_env.epa_recovery.state_dict()
         return state
 
-    def restore_local(self, path, *, allow_capacity_increase=False, resume_config=None):
+    def restore_local(self, path, *, allow_capacity_increase=False, resume_config=None, recover_epa=False):
         state = torch.load(path, map_location=self.ppo_device, weights_only=False)
         extra = state["h2r"]
         old_recipe = extra.get("recipe")
@@ -135,11 +193,18 @@ class ReproductionAgent(PPOAgent):
             if old_recipe is not None and recipe_identity(old_recipe) != recipe_identity(supplied):
                 raise ValueError("Supplied and embedded resume recipes differ")
             old_recipe = supplied
+        if old_recipe is not None and old_recipe.get("epa_recovery") and "epa_recovery" not in extra:
+            raise ValueError("EPA resume checkpoint is missing recovery counters")
         changes = {}
+        recovery_changes = {}
         if extra["binding"] != self.binding:
-            if not allow_capacity_increase:
+            if recover_epa and (old_recipe is None or "epa_recovery" not in old_recipe):
+                changes = recovery_resume_changes(extra["binding"], self.binding, old_recipe, self.recipe, allow_capacity_increase)
+                recovery_changes = dict(before=None, after=deepcopy(EPA_RECOVERY))
+            elif allow_capacity_increase:
+                changes = capacity_resume_changes(extra["binding"], self.binding, old_recipe, self.recipe)
+            else:
                 raise ValueError("Resume task/corpus/base/recipe binding differs")
-            changes = capacity_resume_changes(extra["binding"], self.binding, old_recipe, self.recipe)
         self.set_full_state_weights(state)
         require_finite(self.model.state_dict(), "restored model")
         for values in self.optimizer.state.values():
@@ -150,6 +215,8 @@ class ReproductionAgent(PPOAgent):
         self.update_lr(self.last_lr)
         self.vec_env.common_steps = extra["common_steps"]
         self.vec_env.load_sampler_state(extra["sampler"])
+        if self.vec_env.epa_recovery is not None and "epa_recovery" in extra:
+            self.vec_env.epa_recovery.load_state_dict(extra["epa_recovery"])
         random.setstate(extra["python_rng"])
         np.random.set_state(extra["numpy_rng"])
         torch.set_rng_state(extra["torch_rng"].cpu())
@@ -160,7 +227,7 @@ class ReproductionAgent(PPOAgent):
         write_json(self.output / "resume.json", dict(checkpoint=str(Path(path).resolve()),
             checkpoint_sha256=sha256(path), epoch=self.epoch_num, frame=self.frame,
             old_binding=extra["binding"], binding=self.binding, capacity_changes=changes,
-            world_state_restarted=True))
+            recovery_changes=recovery_changes, world_state_restarted=True))
 
     def env_reset(self):
         obs = super().env_reset()
@@ -222,6 +289,8 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
                   budget_source="H2R explicit limits")
     if args.stage == "imitator":
         recipe["wrist_rsi"] = dict(env.wrist_rsi_recipe)
+    if env.epa_recovery is not None:
+        recipe["epa_recovery"] = deepcopy(EPA_RECOVERY)
     batch = args.worlds*args.horizon
     minibatch = min(1024, batch) if args.small_network else 1024
     if min(args.worlds, args.epochs, args.horizon, args.mini_epochs, args.save_every) < 1 or batch % minibatch or args.diagnostic_every < 0:
@@ -242,6 +311,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         max_epochs=args.epochs, early_stop_epochs=recipe["early_stop_epochs"], save_best_after=recipe["save_best_after"], save_frequency=0,
         print_stats=True, grad_norm=1., entropy_coef=0., truncate_grads=True, e_clip=.2,
         error_if_nonfinite_gradients=True,
+        truncate_invalid_transitions=env.epa_recovery is not None,
         horizon_length=args.horizon, minibatch_size=minibatch, mini_epochs=args.mini_epochs,
         critic_coef=4, clip_value=True, bounds_loss_coef=.0001, use_soft_clamp=True,
         store_base_actions=False, mixed_precision=False, weight_decay=0.)
@@ -252,7 +322,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
     agent = ReproductionAgent(params, output, recipe, binding, diagnostic)
     if args.resume:
         agent.restore_local(args.resume, allow_capacity_increase=args.allow_capacity_increase,
-                            resume_config=args.resume_config)
+                            resume_config=args.resume_config, recover_epa=getattr(args, "recover_epa", False))
         if agent.epoch_num >= args.epochs:
             raise ValueError("Resume epoch must be below requested total --epochs")
     before = {k: v.detach().clone() for k, v in agent.model.named_parameters() if v.requires_grad}
@@ -278,6 +348,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         stop_reason=("native_score_to_win" if float(agent.last_mean_rewards) > recipe["score_to_win"]
                      else "epoch_budget" if agent.epoch_num >= args.epochs else "native_early_stop"),
         frozen_state_unchanged=True, world_state_restarted=bool(args.resume),
+        epa_recovery=env.epa_recovery.state_dict() if env.epa_recovery else None,
         versions={p: importlib.metadata.version(p) for p in ("mjlab", "mujoco", "mujoco-warp", "warp-lang", "torch", "rl-games")}))
     if hasattr(env, "motion"):
         write_json(output / "sampling.json", dict(visits=env.motion.visits.tolist(), transitions=env.motion.transitions.tolist(),
@@ -296,11 +367,14 @@ def train_imitator(args):
     if output.is_relative_to(prepared):
         raise ValueError("Output must be outside prepared inputs")
     output.mkdir(parents=True, exist_ok=False)
-    env = ImitatorEnv(prepared, args.worlds, args.device, args.seed, args.allow_incomplete, buffer_capacities=limits)
+    recovery = EpaRecovery(output / "epa-recovery") if args.recover_epa else None
+    env = ImitatorEnv(prepared, args.worlds, args.device, args.seed, args.allow_incomplete,
+                      buffer_capacities=limits, epa_recovery=recovery)
     dimensions = {k: s.shape[0] for k, s in env.observation_space.spaces.items()}
     params = parameters(dimensions, dimensions, env.sides, {}, env.action_dim, args.small_network)
     saved, recipe = run_training(env, params, args, output, metadata,
-        diagnostic=diagnostic_callback(prepared, output, args.device, args.allow_incomplete, buffer_capacities=limits))
+        diagnostic=diagnostic_callback(prepared, output, args.device, args.allow_incomplete,
+                                       buffer_capacities=limits, recover_epa=args.recover_epa))
     for name in ("robot_mapping.json", "compatibility.json", "motion_manifest.json", "diagnostic_manifest.json", "robot_scene.xml"):
         shutil.copy2(prepared / name, output / name)
     shutil.copytree(prepared / "assets", output / "assets")

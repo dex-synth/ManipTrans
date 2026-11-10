@@ -39,7 +39,8 @@ def sample_wrist_pose(wrist, reference, anchor, rng):
 class ImitatorEnv(MjlabVecEnv):
     wrist_rsi_recipe = WRIST_RSI
 
-    def __init__(self, prepared, count, device, seed=42, allow_partial=False, *, buffer_capacities=None):
+    def __init__(self, prepared, count, device, seed=42, allow_partial=False, *, buffer_capacities=None, epa_recovery=None):
+        self.epa_recovery = epa_recovery
         self.path, metadata = load_artifact(prepared)
         if metadata["format"] != "maniptrans-h2r-pretrain-v1":
             raise ValueError("Expected generalist pretraining reference")
