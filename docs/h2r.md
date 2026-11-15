@@ -188,7 +188,7 @@ Bench 按同一 task/spec 启动 `evaluate-server contact_sensing.include_robot_
   --device cuda:0 [--case CASE_ID ...] [--iterations N] [-- 传给 maniptrans_h2r.train 的选项]
 ```
 
-每个 case 的产物在 `OUTPUT/<name>/prepared` 与 `OUTPUT/<name>/deployment`，`<name>` 为 `case_id` 中 `/` 换成 `-`、`+` 换成 `_`（与 `h2r-bench declare-evaluation --suite` 的命名相同）。各手的 base 按侧别和手部物理签名在给出的 base 中选择，没有匹配时该 case 记为失败并说明缺哪一侧。已完成的步骤跳过；失败的 case 留在 `results.json` 中，其后的 case 继续，存在失败时返回非零。脚本不启动评估，也不把流程返回码当成任务 SR。
+每个 case 的产物在 `OUTPUT/<name>/prepared` 与 `OUTPUT/<name>/deployment`，`<name>` 为 `case_id` 中 `/` 换成 `-`、`+` 换成 `_`（与 `h2r-bench declare-evaluation --suite` 的命名相同）。各手的 base 按侧别和手部物理签名在给出的 base 中选择，没有匹配时该 case 记为失败并说明缺哪一侧。已完成的步骤跳过；每个 case 的结果写入 `OUTPUT/<name>/result.json`，失败的 case 不中断其后的 case，存在失败时返回非零。`--case` 互不重叠的多次运行可以共用同一个 `OUTPUT`，例如按 GPU 分片。脚本不启动评估，也不把流程返回码当成任务 SR。
 
 ## 验证与兼容
 

@@ -5,7 +5,8 @@
 Each case gets OUTPUT/<name>/prepared and OUTPUT/<name>/deployment, where <name> is the case_id
 with "/" replaced by "-" and "+" by "_" (the name `h2r-bench declare-evaluation --suite` uses).
 The base of each hand is chosen among the given ones by side and hand-physics signature.
-Finished steps are skipped, a failed case stays in results.json and later cases still run.
+Finished steps are skipped; every case records its outcome in OUTPUT/<name>/result.json, a failed
+case does not stop later ones, and several runs with disjoint --case sets may share one OUTPUT.
 """
 
 import argparse
@@ -41,14 +42,13 @@ def main():
     bases = {path: load_artifact(path, "imitator")[1] for path in args.imitator}
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    results = []
+    failed = False
     for case in cases:
         if args.case and case.case_id not in args.case:
             continue
         root = output / case.case_id.replace("/", "-").replace("+", "_")
         root.mkdir(exist_ok=True)
-        result = dict(case_id=case.case_id, task_id=case.task_id, output=str(root), status="failed")
-        results.append(result)
+        result = dict(case_id=case.case_id, task_id=case.task_id, task=str(case.task), status="failed")
         prepared, deployment = root / "prepared", root / "deployment"
         if not (prepared / "prepared.json").is_file() and run("prepare", [
                 "--task", str(case.task), "--output", str(prepared), "--iterations", str(args.iterations),
@@ -66,11 +66,13 @@ def main():
                                *(item for side, path in chosen.items() for item in (f"--imitator-{side}", path)),
                                *args.train[1:]], root / "train.log"):
                 result["reason"] = "training failed, see train.log"
-        if "reason" not in result:
+        if "reason" in result:
+            failed = True
+        else:
             result["status"] = "completed"
         print(f"{case.case_id}: {result.get('reason', 'completed')}", flush=True)
-        write_json(output / "results.json", dict(suite=str(Path(args.suite).resolve()), results=results))
-    sys.exit(any(result["status"] != "completed" for result in results))
+        write_json(root / "result.json", result)
+    sys.exit(failed)
 
 
 if __name__ == "__main__":
