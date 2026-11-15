@@ -195,3 +195,5 @@ runs/*
 !tests/h2r/test_*.py
 !requirements-h2r.txt
 !requirements-h2r-overrides.txt
+# The vendored loader records its origin; `h2r-bench check-loader` reads it.
+!maniptrans_h2r/h2r_io/SOURCE.json
