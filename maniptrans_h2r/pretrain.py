@@ -9,7 +9,7 @@ import shutil
 import numpy as np
 
 from .clock import CONTROL_DT_S, PHYSICS_DT_S
-from .h2r_io import load_task, mano
+from .h2r_io import load_task
 from .io import check_files, digest, read_json, seal, sha256, write_json
 from .motion import WIDTH, WINDOW_SCHEMA
 from .pretrain_worker import ordered_results, process, worker_pool
@@ -42,15 +42,13 @@ def prepare(args):
         raise ValueError("--workers must be positive")
     corpus = Path(args.corpus).resolve()
     meta = read_json(corpus / "corpus.json")
-    if meta["format"] != "h2r-hand-motion-corpus-v1" or digest({k: v for k, v in meta.items() if k != "id"}) != meta["id"]:
-        raise ValueError("Unsupported or changed hand corpus")
+    if meta["format"] != "h2r-hand-motion-corpus-v2" or digest({k: v for k, v in meta.items() if k != "id"}) != meta["id"]:
+        raise ValueError("Unsupported or changed hand corpus; export it with the current h2r-bench export-hand-motions "
+                         "(h2r-hand-motion-corpus-v2, the common MANO convention)")
     check_files(corpus, meta["files"])
     if not meta["inventory_complete"] and not args.allow_incomplete:
         raise ValueError("Incomplete source corpus; use --allow-incomplete only for checks")
     clips = [json.loads(line) for line in (corpus / "clips.jsonl").read_text().splitlines() if line.strip()]
-    if any(tuple(clip["tip_vertex_ids"]) != mano.TIP_VERTEX_IDS for clip in clips):
-        raise ValueError("Hand corpus predates the common MANO convention (per-dataset fingertip vertices); "
-                         "export it again with the current h2r-bench export-hand-motions")
     task = load_task(args.task)
     sides = ("right", "left") if args.side == "both" else (args.side,)
     if not set(sides) <= set(task.hand_sides):

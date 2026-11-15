@@ -18,7 +18,7 @@ def clip(count, duration):
 def write_corpus(corpus, clips):
     corpus.mkdir()
     (corpus/'clips.jsonl').write_text(''.join(json.dumps(item)+'\n' for item in clips))
-    meta = dict(format='h2r-hand-motion-corpus-v1', inventory_complete=True,
+    meta = dict(format='h2r-hand-motion-corpus-v2', inventory_complete=True,
                 files={'clips.jsonl': sha256(corpus/'clips.jsonl')})
     write_json(corpus/'corpus.json', dict(meta, id=digest(meta)))
     return corpus
@@ -52,11 +52,13 @@ def test_prepare_records_short_clips_before_mano_interpolation(tmp_path, monkeyp
     assert not (output/'reference_errors.json').exists()
 
 
-def test_corpus_with_per_dataset_fingertips_is_rejected(tmp_path):
-    # Corpora exported before the common MANO convention used TACO's own fingertip vertices.
-    corpus = write_corpus(tmp_path/'corpus', [dict(clip(30, 1.), tip_vertex_ids=[745, 317, 445, 556, 673])])
+def test_corpus_of_an_earlier_format_is_rejected(tmp_path):
+    corpus = write_corpus(tmp_path/'corpus', [clip(30, 1.)])
+    meta = read_json(corpus/'corpus.json')
+    meta['format'] = 'h2r-hand-motion-corpus-v1'  # before the common MANO convention
+    (corpus/'corpus.json').write_text(json.dumps(meta))
     args = SimpleNamespace(corpus=corpus, task=tmp_path/'task', output=tmp_path/'prepared', allow_incomplete=False, side='right')
-    with pytest.raises(ValueError, match='predates the common MANO convention'):
+    with pytest.raises(ValueError, match='h2r-hand-motion-corpus-v2'):
         pretrain.prepare(args)
     assert not args.output.exists()
 
