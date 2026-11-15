@@ -1,15 +1,23 @@
-"""Fit ManipTrans keypoint references on a sealed task's virtual-wrist robot."""
+"""Complete task targets and independently optimized reference-state resets, from one task directory."""
 
 import argparse
 from pathlib import Path
-import shutil
 
+import mujoco
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-from scipy.spatial.transform import Rotation
+from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation, Slerp
 
-from .io import check_inputs, load_arrays, load_task, read_json, seal, write_json
-from .robot import FIT_WEIGHTS, MANO_ORDER, initial_qpos, mapping
+from . import rsi
+from .clock import CONTROL_DT_S, DECIMATION, PHYSICS_DT_S, training_ticks
+from .geometry import encode_bps
+from .h2r_io import export_task, load_task
+from .hand_reference import WristReference, reference_from_points
+from .io import seal, write_json
+from .physics import MAX_PENETRATION_M, check_initial_collision, verify_sealed
+from .robot import command_limits, mapping
+from .robot_physics import signature
 
 
 def velocity(values, times):
@@ -26,93 +34,7 @@ def body_reference(positions, quaternions, times):
     return np.concatenate([positions, quaternions, velocity(positions, times), angular], axis=-1)
 
 
-def fit(task_path, task, robot, arrays, iterations, device):
-    import mujoco
-    import pytorch_kinematics as pk
-    import torch
-
-    model = mujoco.MjModel.from_xml_path(str(task_path / task["scene"]))
-    manifest_path = task_path / "scene/robot/assets/manifest.yaml"
-    import yaml
-    import xml.etree.ElementTree as ET
-    manifest = yaml.safe_load(manifest_path.read_text())
-    urdf = manifest_path.parent / manifest["entrypoints"][task["robot_name"]]["urdf"]
-    tree = ET.fromstring(urdf.read_bytes())
-    # Kinematics parser requires effort/velocity; these are never used for physics.
-    for limit in tree.iter("limit"):
-        limit.attrib.setdefault("effort", "0")
-        limit.attrib.setdefault("velocity", "0")
-    chain = pk.build_chain_from_urdf(ET.tostring(tree)).to(device=device, dtype=torch.float32)
-    parameter_names = chain.get_joint_parameter_names()
-    names = robot["joint_names"]
-    if set(parameter_names) != set(names):
-        raise ValueError("URDF joint set differs from the sealed robot")
-    chain_order = [names.index(n) for n in parameter_names]
-    data = mujoco.MjData(model)
-    data.qpos[:] = initial_qpos(model, task)
-    data.qpos[robot["qpos_indices"]] = 0
-    mujoco.mj_forward(model, data)
-    tracked = [b for side in robot["sides"] for b in robot["hands"][side]["bodies"]]
-    # Verify the kinematic helper against task physics before using its gradients.
-    probe = np.random.default_rng(0).uniform(-0.05, 0.05, len(names))
-    data.qpos[robot["qpos_indices"]] = probe
-    mujoco.mj_forward(model, data)
-    transforms = chain.forward_kinematics(torch.tensor(probe[chain_order][None], dtype=torch.float32, device=device))
-    for body in tracked:
-        if not np.allclose(transforms[body].get_matrix()[0, :3, 3].detach().cpu(), data.body(body).xpos, atol=2e-5):
-            raise ValueError(f"URDF/task FK differs at {body}")
-    data.qpos[robot["qpos_indices"]] = 0
-    mujoco.mj_forward(model, data)
-    count = len(arrays["time_s"])
-    guess = np.zeros((count, len(names)), dtype=np.float32)
-    targets = []
-    wrist_indices = []
-    for side in robot["sides"]:
-        hand = robot["hands"][side]
-        human = arrays[f"{side}_joints_m"][:, MANO_ORDER]
-        local = np.stack([data.body(b).xpos.copy() for b in hand["bodies"]])
-        palm = [5, 9, 13, 17]
-        source = local[palm] - local[:1]
-        desired = human[:, palm] - human[:, :1]
-        u, _, vt = np.linalg.svd(np.einsum("ni,tnj->tij", source, desired))
-        correction = np.broadcast_to(np.eye(3), (count, 3, 3)).copy()
-        correction[:, 2, 2] = np.linalg.det(vt.swapaxes(-1, -2) @ u.swapaxes(-1, -2))
-        rotation = vt.swapaxes(-1, -2) @ correction @ u.swapaxes(-1, -2)
-        idx = hand["indices"]
-        guess[:, idx[:3]] = human[:, 0] - local[0]
-        guess[:, idx[3:6]] = np.unwrap(Rotation.from_matrix(rotation).as_euler("XYZ"), axis=0)
-        targets.append(human)
-        wrist_indices.extend(idx[:6])
-    target = torch.tensor(np.concatenate(targets, axis=1), dtype=torch.float32, device=device)
-    weights = torch.tensor(FIT_WEIGHTS * len(robot["sides"]), dtype=torch.float32, device=device)
-    q = torch.nn.Parameter(torch.tensor(guess, device=device))
-    lower = torch.tensor(robot["lower"], device=device)
-    upper = torch.tensor(robot["upper"], device=device)
-    optimizer = torch.optim.Adam([q], lr=0.0004)
-    for step in range(iterations):
-        transforms = chain.forward_kinematics(q[:, chain_order].clamp(lower[chain_order], upper[chain_order]))
-        points = torch.stack([transforms[b].get_matrix()[:, :3, 3] for b in tracked], dim=1)
-        loss = ((points - target).norm(dim=-1) * weights).mean()
-        optimizer.zero_grad()
-        loss.backward()
-        q.grad[:, wrist_indices] *= 2
-        optimizer.step()
-        with torch.no_grad():
-            q.clamp_(lower, upper)
-        if step % 100 == 0 or step == iterations - 1:
-            print(f"IK {step + 1}/{iterations}: weighted distance {loss.item():.6f} m", flush=True)
-    result = q.detach().cpu().numpy()
-    # Store actual FK of the method reference; human targets remain separate.
-    transforms = chain.forward_kinematics(q[:, chain_order])
-    wrist_quat = []
-    for side in robot["sides"]:
-        matrix = transforms[robot["hands"][side]["bodies"][0]].get_matrix().detach().cpu().numpy()
-        wrist_quat.append(Rotation.from_matrix(matrix[:, :3, :3]).as_quat()[:, [3, 0, 1, 2]])
-    return result, np.stack(wrist_quat, axis=1)
-
-
 def sample_mesh(model, geom_names, body_id, count=1000):
-    import mujoco
     import trimesh
 
     data = mujoco.MjData(model)
@@ -132,103 +54,115 @@ def sample_mesh(model, geom_names, body_id, count=1000):
     return trimesh.sample.sample_surface(trimesh.util.concatenate(pieces), count, seed=0)[0]
 
 
-def prepare(args):
-    import mujoco
+def resample(values, source_times, times):
+    shape = values.shape[1:]
+    flat = values.reshape(len(values), -1)
+    return np.stack([np.interp(times, source_times, flat[:, i]) for i in range(flat.shape[1])], -1).reshape(len(times), *shape)
 
-    source, task = load_task(args.task)
-    if args.bundle or args.robot_bundle:
-        if not args.bundle or not args.robot_bundle:
-            raise ValueError("Pass both --bundle and --robot-bundle, or use the self-contained --task")
-        check_inputs(args.bundle, args.robot_bundle, source, task)
+
+def prepare(args):
+    import torch
+    torch.set_num_threads(4)
+    task = load_task(args.task)
+    demo, binding = task.demo, task.object_binding
     output = Path(args.output).resolve()
-    if output == source or output.is_relative_to(source):
-        raise ValueError("Output must be outside the input task")
+    if output.is_relative_to(task.path):
+        raise ValueError("Output must be outside the task")
     output.mkdir(parents=True, exist_ok=False)
-    try:
-        shutil.copytree(source, output / "task")
-        model = mujoco.MjModel.from_xml_path(str(source / task["scene"]))
-        robot = mapping(model, task)
-        reference = read_json(source / "reference.json")
-        arrays = load_arrays(source / "reference.npz")
-        times = arrays["time_s"]
-        if not np.isclose(times[-1], task["end_tick"] * task["dt_s"], atol=1e-10) or np.any(np.diff(times) <= 0):
-            raise ValueError("Reference clock differs from task")
-        q, wrist_quat = fit(source, task, robot, arrays, args.iterations, args.device)
-        part_order = reference["object_geometry"]["part_order"]
-        part_names = list(task["object"]["parts"])
-        columns = [part_order.index(n) for n in part_names]
-        obj_state = body_reference(arrays["part_pos_m"][:, columns], arrays["part_quat_wxyz"][:, columns], times)
-        targets = dict(item.split("=", 1) for item in args.object)
-        unknown = set(targets) - set(robot["sides"])
-        if unknown:
-            raise ValueError(f"Unknown hand object bindings: {unknown}")
-        prepared = {"time_s": times, "robot_q": q, "robot_dq": velocity(q, times), "object_state": obj_state}
-        for i, side in enumerate(robot["sides"]):
-            hand = robot["hands"][side]
-            human = arrays[f"{side}_joints_m"][:, MANO_ORDER]
-            if side not in targets:
-                if len(part_names) != 1:
-                    raise ValueError(f"Specify --object {side}=PART for a multi-part task")
-                targets[side] = part_names[0]
-            if targets[side] not in part_names:
-                raise ValueError(f"Unknown object part: {targets[side]}")
-            hand["object_part"] = targets[side]
-            part_index = part_names.index(targets[side])
-            body = model.body(task["object"]["parts"][targets[side]])
-            hand["object_mass"] = float(body.mass[0])
-            hand["object_com"] = body.ipos.tolist()
-            vertices = sample_mesh(model, task["object"]["surface_geoms"][targets[side]], body.id)
-            rot = Rotation.from_quat(obj_state[:, part_index, 3:7][:, [1, 2, 3, 0]]).as_matrix()
-            world_vertices = vertices[None] @ rot.swapaxes(-1, -2) + obj_state[:, part_index, None, :3]
-            from scipy.spatial import cKDTree
-            distances = np.stack([cKDTree(v).query(h[[4, 8, 12, 16, 20]])[0] for v, h in zip(world_vertices, human)])
-            prepared[f"{side}_human"] = human
-            prepared[f"{side}_human_velocity"] = velocity(human, times)
-            prepared[f"{side}_wrist"] = body_reference(human[:, 0], wrist_quat[:, i], times)
-            prepared[f"{side}_tip_distance"] = distances
-            prepared[f"{side}_vertices"] = vertices
-            from .geometry import encode_bps
-            prepared[f"{side}_bps"] = encode_bps(vertices)
-        joint_keys = task["object"].get("reference_joint_keys", {"top_hinge": "object_hinge_rad"})
-        if not set(task["object"].get("scoring_parts", part_names)) <= set(targets.values()):
-            raise ValueError("Each scoring part must be assigned to a hand's object-tracking reward")
-        prepared["object_q"] = np.stack([arrays[joint_keys[n]] for n in task["object"]["joints"]], axis=-1) if task["object"]["joints"] else np.empty((len(times), 0))
-        prepared["object_dq"] = velocity(prepared["object_q"], times)
-        np.savez_compressed(output / "reference.npz", **prepared)
-        write_json(output / "robot_mapping.json", robot)
-        from .physics import check_initial_collision
-        initial = initial_qpos(model, task)
-        initial[robot["qpos_indices"]] = q[0]
-        collisions = check_initial_collision(model, initial, task["initialization"]["max_penetration_m"])
-        write_json(output / "initialization.json", {"valid": not collisions, "collisions": collisions})
-        metadata = seal(output, "prepared.json", {"format": "maniptrans-h2r-prepared-v1", "task_id": task["task_id"],
-                        "bundle_id": task["bundle_id"], "robot_manifest_sha256": task["robot_manifest_sha256"],
-                        "part_names": part_names, "ik_iterations": args.iterations, "control_dt_s": task["control_ticks"]*task["dt_s"]})
-        print(f"Prepared {metadata['id']}; initial collision check: {'failed' if collisions else 'passed'}")
-        return output
-    except Exception:
-        shutil.rmtree(output)
-        raise
+    export_task(task, output / "task")
+    model = mujoco.MjModel.from_xml_path(str(task.scene_xml))
+    verify_sealed(model, task.compiled)
+    robot = command_limits(model, mapping(model, task))
+    # The method's reference grid: one sample per control period, plus the task endpoint.
+    end = training_ticks(task.duration_s)
+    times = np.unique(np.r_[np.arange(0, end+1, DECIMATION), end])*PHYSICS_DT_S
+    parts, scoring = list(binding["parts"]), list(binding["scoring_parts"])
+    poses = [demo.part_pose(part) for part in parts]
+    positions = resample(np.stack([p for p, _ in poses], 1), demo.time_s, times)
+    quats = np.stack([Slerp(demo.time_s, Rotation.from_quat(q, scalar_first=True))(times).as_quat(scalar_first=True)
+                      for _, q in poses], axis=1)
+    reference = dict(time_s=times, object_state=body_reference(positions, quats, times))
+    joints = [joint for obj in demo.objects.values() for joint in obj.joints]
+    if [joint.name for joint in joints] != list(binding["joints"]):
+        raise ValueError("Object joint order differs from the evaluation binding")
+    reference["object_q"] = (np.stack([np.interp(times, demo.time_s, joint.position_rad) for joint in joints], axis=-1)
+                             if joints else np.empty((len(times), 0)))
+    reference["object_dq"] = velocity(reference["object_q"], times)
+    surfaces = {p: sample_mesh(model, binding["surface_geoms"][p], model.body(binding["parts"][p]).id) for p in scoring}
+    overrides = dict(item.split("=", 1) for item in args.object)
+    if set(overrides)-set(robot["sides"]) or set(overrides.values())-set(scoring):
+        raise ValueError("Invalid primary-part override")
+    canonical = np.zeros((len(times), len(robot["joint_names"])), np.float32)
+    guess = np.broadcast_to(np.clip(np.pi/36, robot["lower"], robot["upper"]), canonical.shape).copy()
+    for side in robot["sides"]:
+        points = resample(demo.hands[side].joints_m, demo.time_s, times)
+        targets = reference_from_points(model, robot, side, points, times)
+        wrist_q = targets.pop("wrist_q")
+        reference.update(targets)
+        hand = robot["hands"][side]
+        canonical[:, hand["indices"][:6]] = wrist_q
+        distances = []
+        for part, vertices in surfaces.items():
+            index = parts.index(part)
+            world = vertices[None]@Rotation.from_quat(quats[:, index], scalar_first=True).as_matrix().swapaxes(-1, -2)+positions[:, index, None]
+            distances.append(np.stack([cKDTree(v).query(h[[4, 8, 12, 16, 20]])[0] for v, h in zip(world, reference[f"{side}_human"])]))
+        distances = np.stack(distances, -1)
+        part = overrides.get(side) or min(scoring, key=lambda p: (float(np.median(distances[..., scoring.index(p)].mean(axis=1))), p))
+        body = model.body(binding["parts"][part])
+        hand.update(object_part=part, object_mass=float(body.mass[0]), object_com=body.ipos.tolist())
+        reference.update({f"{side}_tip_distance_by_part": distances, f"{side}_tip_distance": distances.min(-1),
+                          f"{side}_vertices": surfaces[part], f"{side}_bps": encode_bps(surfaces[part])})
+        human = reference[f"{side}_human"]
+        direction = (human[:, 0]+human[:, 9])/2-positions[:, parts.index(part)]
+        length = np.linalg.norm(direction, axis=1, keepdims=True)
+        rotation = Rotation.from_quat(reference[f"{side}_wrist"][:, 3:7], scalar_first=True).as_matrix()
+        direction = np.where(length > 1e-10, direction/np.maximum(length, 1e-10), rotation[:, :, 2])
+        wrist = WristReference(model, robot, side)
+        # The outward IK initialization may lie outside workspace; project the guess only.
+        position = human[:, 0]+.2*direction
+        xyz = np.linalg.solve(wrist.translation_axes, (position-wrist.origin).T).T
+        initial_wrist = wrist_q.copy()
+        initial_wrist[:, :3] = xyz
+        guess[:, hand["indices"][:6]] = np.clip(initial_wrist, wrist.lower, wrist.upper)
+    reference["robot_q"] = canonical
+    reference["robot_dq"] = velocity(canonical, times)
+    optimized, ik = rsi.fit(task, robot, reference, guess, args.iterations, args.device)
+    qpos, qvel = rsi.states(model, task, robot, reference, optimized)
+    valid, reasons = rsi.validate(model, task, robot, reference, qpos, surfaces)
+    np.savez_compressed(output / "reference.npz", **reference)
+    np.savez_compressed(output / "rsi.npz", qpos=qpos, qvel=qvel, valid_start=valid, time_s=times)
+    wrist_ids = [i for s in robot["sides"] for i in robot["hands"][s]["indices"][:6]]
+    write_json(output / "rsi.json", dict(valid_start_count=int(valid.sum()), total_count=len(valid),
+        reasons=reasons, ik=ik, ik_iterations=args.iterations, max_penetration_m=MAX_PENETRATION_M,
+        wrist_reference_difference=(optimized[:, wrist_ids]-canonical[:, wrist_ids]).max(axis=0).tolist()))
+    for p, vertices in surfaces.items():
+        np.save(output / f"surface-{parts.index(p)}.npy", vertices)
+    collisions = check_initial_collision(model, qpos[0])
+    write_json(output / "initialization.json", dict(valid=not collisions, collisions=collisions,
+        max_penetration_m=MAX_PENETRATION_M, robot_q=optimized[0].tolist(), joint_names=robot["joint_names"],
+        near_contact_diagnostic=reasons[0]))
+    write_json(output / "robot_mapping.json", robot)
+    metadata = seal(output, "prepared", dict(task_id=task.task_id, demo_id=demo.demo_id, robot_id=task.robot.robot_id,
+        dataset=task.dataset, profile=task.profile, part_names=parts, object_bodies=binding["parts"],
+        scoring_parts=scoring, object_joint_names=list(binding["joints"]),
+        gravity_m_s2=float(np.linalg.norm(model.opt.gravity)),
+        compatibility={s: signature(model, robot, s) for s in robot["sides"]},
+        control_dt_s=CONTROL_DT_S, physics_dt_s=PHYSICS_DT_S, physics_schedule="native-residual-v1", ik=ik))
+    print(f"Prepared {metadata['id']}; valid RSI starts {valid.sum()}/{len(valid)}; initial collision {'failed' if collisions else 'passed'}")
+    return output
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True)
-    parser.add_argument("--bundle")
-    parser.add_argument("--robot-bundle")
+    parser.add_argument("--task", required=True, help="Task directory (standalone or inside a suite)")
     parser.add_argument("--output", required=True)
     parser.add_argument("--object", action="append", default=[], metavar="SIDE=PART")
     parser.add_argument("--iterations", type=int, default=4000)
-    parser.add_argument("--legacy-v1", action="store_true", help="Explicit legacy single-demonstration preparation")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     if args.iterations < 1:
         parser.error("--iterations must be positive")
-    if args.legacy_v1:
-        prepare(args)
-    else:
-        from .prepare_v2 import prepare as prepare_v2
-        prepare_v2(args)
+    prepare(args)
 
 
 if __name__ == "__main__":
