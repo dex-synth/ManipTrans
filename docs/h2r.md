@@ -36,7 +36,7 @@ uv pip compile --python 3.11 requirements-h2r.txt \
 
 ## 阶段 1：通用单手预训练
 
-先在 bench 环境运行 `export-hand-motions`，从 ARCTIC、OakInk2、HOT3D、TACO 的全部可用源录制导出共同手部 corpus，不受 manipulation `included` 清单限制。该 corpus 只含来源、MANO 参数、关键点、有效区间与质量记录，不含机器人 IK。四个数据集的指尖统一取 MANO 顶点 `744,320,443,554,671`；此前按数据集取指尖顶点的 corpus 会被拒绝，须重新导出。合成片段的 MANO 重新解码经 `h2r_io.mano.decode` 完成，并按片段记录处理左手形状基镜像。
+先在 bench 环境运行 `export-hand-motions`，从 ARCTIC、OakInk2、HOT3D、TACO 的全部可用源录制导出共同手部 corpus，不受 manipulation `included` 清单限制。该 corpus 只含来源、MANO 参数、关键点、有效区间与质量记录，不含机器人 IK。corpus 格式为 `h2r-hand-motion-corpus-v2`，四个数据集的指尖统一取 MANO 顶点 `744,320,443,554,671`；更早格式的 corpus 会被拒绝，须重新导出。合成片段的 MANO 重新解码经 `h2r_io.mano.decode` 完成，并按片段记录处理左手形状基镜像。
 
 最短训练片段规则由本方法的 `pretrain prepare` 执行：源帧少于 4 帧或时长不足 .5 秒（容差 `1e-10s`）的片段在 MANO 插值及合成前排除。`clip_selection.json` 保存阈值、选中数量和排除片段的来源；这是训练选择，不是参考构造错误，不会因此将完整 corpus 标为 partial。筛选规则同时写入 prepared 的 `recipe.clip_filter`。Bench 的导出保留单帧等短片段。
 
