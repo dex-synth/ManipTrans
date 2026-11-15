@@ -10,9 +10,9 @@ from maniptrans_h2r.hand_reference import continuous_euler, quaternion_signs
 from maniptrans_h2r.motion import MotionCache, pack
 from maniptrans_h2r.policy import build, parameters
 from maniptrans_h2r.residual_reward import hand_inputs, native_call, residual_reward
-from maniptrans_h2r.robot_physics import require_clock
+from maniptrans_h2r.clock import CONTROL_DT_S, DECIMATION, PHYSICS_DT_S, training_ticks
 from maniptrans_h2r.rsi import sampling_probabilities
-from maniptrans_h2r.control import PositionControl
+from maniptrans_h2r.control import CONTROL, PositionControl
 
 
 def test_euler_branches_are_continuous_through_wrap_and_gimbal():
@@ -28,9 +28,11 @@ def test_euler_branches_are_continuous_through_wrap_and_gimbal():
 def test_quaternion_signs_and_clock_do_not_silently_change_semantics():
     q = quaternion_signs(np.array([[-1., 0, 0, 0], [1., 0, 0, 0]]))
     np.testing.assert_array_equal(q, [[1, 0, 0, 0], [1, 0, 0, 0]])
-    require_clock(dict(dt_s=1/120, control_ticks=2))
-    with pytest.raises(ValueError):
-        require_clock(dict(dt_s=1/240, control_ticks=8))
+    # Native 60 Hz control over 120 Hz physics, whatever nominal step a task carries.
+    assert (CONTROL_DT_S, PHYSICS_DT_S, DECIMATION) == (1/60, 1/120, 2)
+    assert training_ticks(29/30) == 116
+    with pytest.raises(ValueError, match='whole number'):
+        training_ticks(1/300)
 
 
 def test_motion_cache_visits_more_windows_than_worlds_and_clamps_only_queries(tmp_path):
@@ -59,12 +61,12 @@ def test_rsi_probabilities_preserve_original_indices_and_partial_final_bin():
         sampling_probabilities(5, np.zeros(5, bool))
 
 
-def test_v2_control_clips_enabled_ranges_and_fingers_only():
+def test_control_clips_enabled_ranges_and_fingers_only():
     robot = dict(joint_names=list(range(7)), lower=[-1]*7, upper=[1]*7,
                  command_lower=[-1e20]*6+[-.3], command_upper=[1e20]*5+[.2, .3], hands={'right': {'indices': list(range(7))}})
-    control = PositionControl(robot, 1, 'cpu', dict(schema='virtual-wrist-position-v2', wrist_translation_m=.05, wrist_rotation_rad=.3, moving_average=1))
+    control = PositionControl(robot, 1, 'cpu', dict(CONTROL, wrist_translation_m=.05, wrist_rotation_rad=.3))
     action = torch.ones(1, 14)
-    output = control.decode(action, torch.ones(1, 7), ['right'], True)
+    output = control.decode(action, ['right'], True, torch.ones(1, 7))
     assert output[0, 0] > 1  # Unbounded wrist command is not clipped to q range.
     assert output[0, 5].item() == pytest.approx(.2)
     assert output[0, 6].item() == pytest.approx(.3)

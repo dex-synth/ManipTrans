@@ -14,6 +14,7 @@ import yaml
 from mjlab.sim import Simulation, SimulationCfg
 from mjlab.sim.sim import MujocoCfg
 
+from .clock import DECIMATION, PHYSICS_DT_S
 from .control import CONTROL, PositionControl
 from .buffers import SimulationOverflow, capacities, check_overflow
 from .recovery import STATE_KEYS
@@ -62,7 +63,9 @@ class MjlabVecEnv:
         self.sides = robot["sides"]
         self.env = self
         self.epa_recovery = getattr(self, "epa_recovery", None)
-        self.control_dt_s, self.decimation = 1/60, 2
+        if abs(model.opt.timestep-PHYSICS_DT_S) > 1e-12:
+            # Training physics is the method's own; a task's nominal step must never reach it.
+            raise ValueError(f"Training model has a {model.opt.timestep:g} s step, not the method's {PHYSICS_DT_S:g} s training physics step")
         torch.cuda.set_device(device)
         wp.init()
         wp.set_device(device)
@@ -86,7 +89,7 @@ class MjlabVecEnv:
         self.model, self.data = self.sim.wp_model, self.sim.wp_data
         self.model.opt.tolerance.fill_(float(model.opt.tolerance))
         self.sim.create_graph()
-        self.audit = gpu_audit(model, self.model, {"task_id": metadata.get("task_id", "single-hand")}, metadata["scene_sha256"])
+        self.audit = gpu_audit(model, self.model, metadata.get("task_id", "single-hand"), metadata["scene_sha256"])
         self.audit["training_framework"] = "mjlab"
         self.audit["capacity"] = dict(contacts_per_world=self.sim.cfg.nconmax, constraints_per_world=self.sim.cfg.njmax,
                                      contact_sensor=CAPACITY)
@@ -183,11 +186,10 @@ class MjlabVecEnv:
     def step(self, actions):
         if self.done.any():
             raise RuntimeError("Call reset_done before stepping completed environments")
-        target = self.target(1)
         positions = self.views["qpos"][:, self.robot["qpos_indices"]]
-        commands = self.control.decode(actions, target["robot_q"], self.sides, self.stage == "residual", positions=positions)
+        commands = self.control.decode(actions, self.sides, self.stage == "residual", positions)
         self.views["ctrl"][:, self.robot["actuator_indices"]] = commands[:, self.robot["ctrl_joint_indices"]]
-        steps = self.remaining_ticks().clamp(max=2)
+        steps = self.remaining_ticks().clamp(max=DECIMATION)
         power = torch.zeros_like(commands)
         invalid = torch.zeros(self.count, dtype=torch.bool, device=self.device)
         recovering = False

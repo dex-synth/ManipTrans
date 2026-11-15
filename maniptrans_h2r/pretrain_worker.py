@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .clock import CONTROL_DT_S
 from .hand_reference import MotionInterpolator, WristReference, pretraining_reference
 from .io import digest, load_arrays, read_json
 from .motion import pack
@@ -48,7 +49,7 @@ class ClipWorker:
         with ExitStack() as stack:
             streams = {side: stack.enter_context(open(row["path"], "wb")) for side, row in result.items()}
             for synthetic, endpoints, length in recipes:
-                times = np.arange(int(np.floor(length*60+1e-9))+1)/60
+                times = np.arange(int(np.floor(length/CONTROL_DT_S+1e-9))+1)*CONTROL_DT_S
                 try:
                     points = motion(times, endpoints=endpoints)
                 except ValueError as exc:

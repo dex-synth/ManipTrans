@@ -13,9 +13,6 @@ warmup_steps: 10
 start_lr: 0.000001
 save_every: 100
 diagnostic_every: 100
-control_hz: 60
-physics_hz: 120
-decimation: 2
 moving_average: 1.0
 physics_schedule: native-residual-v1
 contact_capacity: 512

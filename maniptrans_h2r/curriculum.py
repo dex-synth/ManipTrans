@@ -51,7 +51,7 @@ class PhysicsCurriculum(ResetSchedule):
         import warp as wp
         self.env = env
         model = env.cpu
-        bodies = {model.body(b).id for b in env.task["object"]["parts"].values()}
+        bodies = {model.body(b).id for b in env.metadata["object_bodies"]}
         for body in range(1, model.nbody):
             if model.body_parentid[body] in bodies:
                 bodies.add(body)
@@ -96,7 +96,7 @@ class PhysicsCurriculum(ResetSchedule):
         try:
             self.gpu_friction.copy_(torch.as_tensor(self.env.cpu.geom_friction, device=self.env.device))
             self.gpu_gravity.copy_(torch.as_tensor(self.nominal_gravity, device=self.env.device))
-            gpu_audit(self.env.cpu, self.env.model, self.env.task, self.env.metadata["scene_sha256"])
+            gpu_audit(self.env.cpu, self.env.model, self.env.task.task_id, self.env.metadata["scene_sha256"])
         finally:
             self.gpu_friction.copy_(saved_friction)
             self.gpu_gravity.copy_(saved_gravity)

@@ -8,7 +8,9 @@ import shutil
 
 import numpy as np
 
-from .io import check_files, digest, load_task, read_json, seal, sha256, write_json
+from .clock import CONTROL_DT_S, PHYSICS_DT_S
+from .h2r_io import load_task, mano
+from .io import check_files, digest, read_json, seal, sha256, write_json
 from .motion import WIDTH, WINDOW_SCHEMA
 from .pretrain_worker import ordered_results, process, worker_pool
 from .robot import command_limits, mapping
@@ -46,9 +48,15 @@ def prepare(args):
     if not meta["inventory_complete"] and not args.allow_incomplete:
         raise ValueError("Incomplete source corpus; use --allow-incomplete only for checks")
     clips = [json.loads(line) for line in (corpus / "clips.jsonl").read_text().splitlines() if line.strip()]
-    source, task = load_task(args.task)
+    if any(tuple(clip["tip_vertex_ids"]) != mano.TIP_VERTEX_IDS for clip in clips):
+        raise ValueError("Hand corpus predates the common MANO convention (per-dataset fingertip vertices); "
+                         "export it again with the current h2r-bench export-hand-motions")
+    task = load_task(args.task)
+    sides = ("right", "left") if args.side == "both" else (args.side,)
+    if not set(sides) <= set(task.hand_sides):
+        raise ValueError(f"--side {args.side} needs a task whose robot has those hands; this one has {list(task.hand_sides)}")
     output = Path(args.output).resolve()
-    if output.is_relative_to(source) or output.is_relative_to(corpus):
+    if output.is_relative_to(task.path) or output.is_relative_to(corpus):
         raise ValueError("Output must be outside its sealed inputs")
     output.mkdir(parents=True, exist_ok=False)
     clips, excluded = select_clips(clips)
@@ -58,13 +66,12 @@ def prepare(args):
     mano_hashes = {side: sha256(Path(args.mano_root) / f"MANO_{side.upper()}.pkl") for side in {c["source_side"] for c in clips}}
     if any(mano_hashes[c["source_side"]] != c["mano_sha256"] for c in clips):
         raise ValueError("MANO assets differ from exported corpus")
-    sides = ("right", "left") if args.side == "both" else (args.side,)
     outputs = {side: output / side if args.side == "both" else output for side in sides}
-    model = mujoco.MjModel.from_xml_path(str(source / task["scene"]))
+    model = mujoco.MjModel.from_xml_path(str(task.scene_xml))
     robot = mapping(model, task)
     states = {}
     for side, destination in outputs.items():
-        hand_model, hand_robot, compatibility = extract_hand(source, task, robot, side, destination)
+        hand_model, hand_robot, compatibility = extract_hand(task, robot, side, destination)
         command_limits(hand_model, hand_robot)
         write_json(destination / "robot_mapping.json", hand_robot)
         if destination != output:
@@ -125,10 +132,10 @@ def finish_preparation(output, side, state, meta, task, args):
             indices = np.linspace(0, len(choices)-1, min(32, len(choices)), dtype=int)
             diagnostic.extend(choices[i] for i in indices)
     write_json(output / "diagnostic_manifest.json", dict(windows=diagnostic, overlap="training-corpus tracking diagnostic"))
-    result = seal(output, "prepared.json", dict(format="maniptrans-h2r-pretrain-v1", side=side,
+    result = seal(output, "pretrain", dict(side=side,
         corpus_id=meta["id"], partial=bool(not meta["inventory_complete"] or errors),
-        compatibility=state["compatibility"], control_dt_s=1/60, physics_dt_s=1/120, source_task_id=task["task_id"],
-        preparation_revision=2,
+        compatibility=state["compatibility"], control_dt_s=CONTROL_DT_S, physics_dt_s=PHYSICS_DT_S,
+        source_task_id=task.task_id,
         recipe=dict(seed=args.seed, synthetic_fraction=args.synthetic_fraction, augmentation="interpolated_mano_v1",
                     windowing=WINDOW_SCHEMA, clip_filter=CLIP_FILTER)))
     print(f"Prepared generalist reference: {result['id']}")
@@ -139,7 +146,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     prep = sub.add_parser("prepare")
     prep.add_argument("--corpus", required=True)
-    prep.add_argument("--task", required=True)
+    prep.add_argument("--task", required=True, help="Task directory whose robot provides the hand model")
     prep.add_argument("--side", choices=("left", "right", "both"), required=True,
                       help="both shares human decoding and writes OUTPUT/right and OUTPUT/left")
     prep.add_argument("--workers", type=int, default=8, help="Clip worker processes, each with one numerical thread (default: 8)")

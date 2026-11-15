@@ -1,6 +1,4 @@
 from copy import deepcopy
-import socket
-import struct
 import subprocess
 import sys
 
@@ -8,21 +6,21 @@ import numpy as np
 import pytest
 import torch
 
-from maniptrans_h2r.control import PositionControl
 from maniptrans_h2r.geometry import bps_basis, encode_bps
-from maniptrans_h2r.io import load_artifact, read_json, seal
+from maniptrans_h2r.io import digest, load_artifact, read_json, seal, write_json
 from maniptrans_h2r.observations import Reference, protocol_state, state_difference
 from maniptrans_h2r.policy import Policy, build, parameters
-from maniptrans_h2r.protocol import receive, send
 
 
 def test_sealed_inputs_reject_tampering_and_nonfinite(tmp_path):
     (tmp_path / "value").write_text("original")
-    seal(tmp_path, "prepared.json", {"format": "test"})
-    load_artifact(tmp_path)
+    seal(tmp_path, "prepared", {})
+    load_artifact(tmp_path, "prepared")
+    with pytest.raises(ValueError, match="reads 'maniptrans-h2r-pretrain-v2'"):
+        load_artifact(tmp_path, "pretrain")  # The same file name, another kind of artifact.
     (tmp_path / "value").write_text("changed")
     with pytest.raises(ValueError, match="Changed dependency"):
-        load_artifact(tmp_path)
+        load_artifact(tmp_path, "prepared")
     for content in ('{"a": 1, "a": 2}', '{"a": 1e999}', '{"a": NaN}'):
         (tmp_path / "bad.json").write_text(content)
         with pytest.raises(ValueError):
@@ -50,35 +48,29 @@ def test_reference_clock_and_quaternion_sign():
     torch.testing.assert_close(state_difference(sampled, sampled), state_difference(changed, sampled))
 
 
-def test_wrist_position_residual_and_episode_history():
-    robot = dict(joint_names=list(range(8)), lower=[-1]*8, upper=[1]*8,
-                 hands={"right": {"indices": list(range(8))}})
-    control = PositionControl(robot, 2, "cpu", dict(wrist_translation_m=.1, wrist_rotation_rad=.2, moving_average=.5))
-    initial = torch.zeros(2, 8)
-    control.reset([0, 1], initial)
-    target = initial.clone()
-    target[:, :6] = .25
-    action = torch.zeros(2, 16)
-    action[0, :8] = .5
-    action[0, 8:] = .25
-    result = control.decode(action, target, ["right"], True)
-    torch.testing.assert_close(result[0], torch.tensor([.175]*3+[.225]*3+[.5]*2))
-    previous = result[0].clone()
-    control.reset([1], torch.zeros(1, 8))
-    torch.testing.assert_close(control.previous[0], previous)
+@pytest.mark.parametrize("kind,name,old", [
+    ("prepared", "prepared.json", "maniptrans-h2r-prepared-v2"), ("pretrain", "prepared.json", "maniptrans-h2r-pretrain-v1"),
+    ("imitator", "imitator.json", "maniptrans-h2r-imitator-v1"), ("deployment", "deployment.json", "maniptrans-h2r-deployment-v2")])
+def test_artifacts_of_the_former_task_format_are_rejected(tmp_path, kind, name, old):
+    # A consistent artifact as the previous version sealed it: bound to a bundle, 120 Hz task ticks.
+    metadata = dict(format=old, task_id="t", bundle_id="b", robot_manifest_sha256="r", files={})
+    write_json(tmp_path / name, dict(metadata, id=digest(metadata)))
+    with pytest.raises(ValueError, match="earlier task format cannot be reused: prepare and train again"):
+        load_artifact(tmp_path, kind)
 
 
-def test_contact_force_sign_and_missing_contact_rejection():
+def test_contact_force_sign_joint_order_and_missing_contact_rejection():
     robot = {"sides": ["right"], "hands": {"right": {"bodies": ["tip"], "contact_bodies": ["tip"]}}}
-    task = {"object": {"parts": {"part": "object"}}}
-    frame = dict(robot_q=[0], robot_dq=[0], object_q=[], object_dq=[],
+    frame = dict(robot_q=[1, 2], robot_dq=[3, 4], object_q=[5], object_dq=[6],
                  bodies={"tip": [0]*13, "object": [0]*13},
-                 contacts={"records": [{"body1": "tip", "body2": "object", "force_on_body2_world": [1, 2, 3]}]})
-    state = protocol_state([frame], robot, task, "cpu")
-    torch.testing.assert_close(state["tip_force"]["right"][0, 0], torch.tensor([-1., -2., -3.]))
+                 contacts={"records": [{"body1": "tip", "body2": "object", "force_on_body2_world": [1, 2, 3]},
+                                       {"body1": "other", "body2": "tip", "force_on_body2_world": [0, 0, 10]}]})
+    state = protocol_state([frame], robot, ["object"], dict(robot=[1, 0], object=[0]), "cpu")
+    torch.testing.assert_close(state["tip_force"]["right"][0, 0], torch.tensor([-1., -2., 7.]))
+    assert state["robot_q"].tolist() == [[2, 1]] and state["robot_dq"].tolist() == [[4, 3]]
     frame["contacts"] = None
     with pytest.raises(ValueError, match="missing"):
-        protocol_state([frame], robot, task, "cpu")
+        protocol_state([frame], robot, ["object"], dict(robot=[1, 0], object=[0]), "cpu")
 
 
 def test_native_policy_episode_rng_and_conditional_base_actions(tmp_path):
@@ -103,19 +95,6 @@ def test_native_policy_episode_rng_and_conditional_base_actions(tmp_path):
                       "obs": dict(observation), "base_actions": base_actions})
     torch.testing.assert_close(forward()["mus"], forward()["mus"], rtol=0, atol=0)
     assert all(not p.requires_grad for p in model.a2c_network.base_model.parameters())
-
-
-def test_protocol_rejects_duplicate_and_overflow_numbers():
-    for payload in (b'{"a":1,"a":2}', b'{"a":1e999}'):
-        left, right = socket.socketpair()
-        with left, right:
-            left.sendall(struct.pack("!I", len(payload))+payload)
-            with pytest.raises(ValueError):
-                receive(right)
-    left, right = socket.socketpair()
-    with left, right:
-        send(left, {"type": "step", "commands": {}})
-        assert receive(right) == {"type": "step", "commands": {}}
 
 
 def test_online_import_does_not_load_a_physics_runtime():

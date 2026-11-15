@@ -163,7 +163,7 @@ def test_old_resume_binding_is_rejected_before_loading_state(tmp_path):
     agent.binding = dict(recipe_id='current-rsi-recipe')
     path = tmp_path/'old-resume.pth'
     torch.save(dict(h2r=dict(binding=dict(recipe_id='old-rsi-recipe'))), path)
-    with pytest.raises(ValueError, match='binding differs'):
+    with pytest.raises(ValueError, match='Earlier checkpoints cannot be continued'):
         agent.restore_local(path)
 
 

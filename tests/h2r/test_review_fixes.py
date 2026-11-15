@@ -12,7 +12,8 @@ import torch
 
 from maniptrans_h2r.hand_reference import continuous_euler
 from maniptrans_h2r.policy import build, parameters
-from maniptrans_h2r.robot_physics import require_compatibility, signature
+from maniptrans_h2r.clock import PHYSICS_DT_S
+from maniptrans_h2r.robot_physics import same_signature, signature
 
 
 def test_wrist_chooses_one_branch_for_the_whole_clip():
@@ -49,7 +50,7 @@ def test_power_uses_post_step_velocity_and_preserves_short_terminal(monkeypatch)
         views['qfrc_actuator'][:] = 2
     env = SimpleNamespace(count=2, device='cpu', done=torch.zeros(2, dtype=torch.bool),
         views=views, robot=dict(actuator_indices=[0], ctrl_joint_indices=[0], qvel_indices=[0], qpos_indices=[0]),
-        control=SimpleNamespace(decode=lambda *args, **kwargs: torch.zeros(2, 1)), stage='residual', sides=[],
+        control=SimpleNamespace(decode=lambda *args: torch.zeros(2, 1)), stage='residual', sides=[],
         sim=SimpleNamespace(step=simulate), data=SimpleNamespace(overflow=torch.zeros(2)),
         curriculum=None, completed_controls=torch.zeros(2, dtype=torch.long),
         tick=torch.zeros(2, dtype=torch.long), elapsed_ticks=torch.zeros(2, dtype=torch.long), common_steps=0,
@@ -84,14 +85,27 @@ def test_signature_includes_joint_constraint_physics(field, value):
     assert signature(model, robot, 'right')['robot_physics_id'] != before['robot_physics_id']
 
 
-def test_signature_covers_ccd_and_rejects_unsigned_hand_constraints():
+def test_signature_covers_ccd_and_carries_the_training_step_not_the_task_step():
     model, robot = physics_fixture()
     before = signature(model, robot, 'right')
-    require_compatibility(before)
     model.opt.ccd_iterations = 2
-    assert signature(model, robot, 'right')['physics_options_id'] != before['physics_options_id']
-    with pytest.raises(ValueError, match='Re-prepare'):
-        require_compatibility(dict(reference_schema='hand-reference-v2'))
+    changed = signature(model, robot, 'right')
+    assert changed['physics_options_id'] != before['physics_options_id'] and not same_signature(before, changed)
+    model.opt.ccd_iterations = before['options']['ccd_iterations']
+    model.opt.timestep = 1/300  # A task's nominal step never reaches the base identity.
+    nominal = signature(model, robot, 'right')
+    assert nominal == before and nominal['options']['timestep'] == nominal['physics_dt_s'] == PHYSICS_DT_S
+
+
+def test_same_hand_compiled_in_another_scene_is_the_same_signature():
+    model, robot = physics_fixture()
+    before = signature(model, robot, 'right')
+    model.actuator_biasprm[0, 2] -= 1e-16  # Compile roundoff of a damping derived from dampratio.
+    model.actuator_biasprm[0, 1] *= 1+1e-15
+    roundoff = signature(model, robot, 'right')
+    assert roundoff['robot_physics_id'] != before['robot_physics_id'] and same_signature(before, roundoff)
+    model.geom_friction[1, 0] = .8  # A scene with other contact parameters needs its own base.
+    assert not same_signature(before, signature(model, robot, 'right'))
 
 
 @pytest.mark.parametrize('constraint', [
@@ -105,7 +119,7 @@ def test_unsigned_hand_constraints_fail_explicitly(constraint):
         signature(model, robot, 'right')
 
 
-@pytest.mark.parametrize('sides', [[], ['right'], ['right', 'left']])
+@pytest.mark.parametrize('sides', [[], ['right'], ['left'], ['right', 'left']])
 @pytest.mark.parametrize('head,value', [('mu', float('nan')), ('value', float('inf')), ('sigma', 1000.)])
 def test_h2r_policy_fails_before_nan_to_num(tmp_path, sides, head, value):
     torch.set_num_threads(2)

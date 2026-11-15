@@ -13,7 +13,6 @@ import yaml
 
 from maniptrans_h2r.curriculum import ResetSchedule
 from maniptrans_h2r.residual_reward import hand_reward, residual_reward
-from maniptrans_h2r.robot_physics import require_contacts
 from maniptrans_h2r.rsi import optimize_sequence
 from test_reproduction import reward_fixture
 
@@ -36,13 +35,6 @@ def test_failure_grace_counts_calls_before_current_action():
     history = {'right': torch.ones(2, 3, 5, dtype=torch.bool)}
     assert hand_reward(robot, 'right', state, target, power, actions, torch.tensor([19, 20]), .7)[1].tolist() == [False, True]
     assert residual_reward(robot, [0], state, target, power, actions, torch.tensor([7, 8]), .7, history)[1].tolist() == [False, True]
-
-
-def test_coverage_is_required_even_when_contact_schema_matches():
-    obs = dict(contacts=True, contact_schema='h2r-body-contacts-v1')
-    with pytest.raises(ValueError, match='coverage'):
-        require_contacts(dict(observation=obs))
-    require_contacts(dict(observation=dict(obs, contact_coverage='robot-all-v1')))
 
 
 def test_curriculum_matches_native_reset_method_and_property_helpers():
@@ -129,7 +121,7 @@ def test_ik_native_stop_uses_global_100_iteration_checks(improvement, expected):
     assert stats['stop_reason'] == 'native_loss_improvement'
 
 
-@pytest.mark.parametrize('sides', [['right'], ['right', 'left']])
+@pytest.mark.parametrize('sides', [['right'], ['left'], ['right', 'left']])
 def test_native_forward_and_ppo_updates_with_resampled_bases(tmp_path, sides):
     import os
     from types import MethodType

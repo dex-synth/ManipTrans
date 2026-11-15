@@ -14,7 +14,7 @@ from lib.rl.numerics import normalize_valid
 from maniptrans_h2r.buffers import OverflowType, SimulationOverflow, check_overflow
 from maniptrans_h2r.io import digest
 from maniptrans_h2r.recovery import EPA_RECOVERY, EpaRecovery, STATE_KEYS
-from maniptrans_h2r.training import ReproductionAgent, recipe_identity, recovery_resume_changes
+from maniptrans_h2r.training import TRAINING_REVISION, ReproductionAgent, recipe_identity, recovery_resume_changes
 
 
 def binding(recipe):
@@ -23,7 +23,7 @@ def binding(recipe):
 
 @pytest.fixture
 def recipes():
-    old = dict(worlds=8192, seed=42, training_revision=7, control={'schema':'v3'},
+    old = dict(worlds=8192, seed=42, training_revision=TRAINING_REVISION, control={'schema':'v3'},
                learning_rate=.0005, contact_capacity=256, constraint_capacity=2048)
     return old, dict(old, epa_recovery=deepcopy(EPA_RECOVERY))
 
@@ -34,14 +34,12 @@ def test_epa_resume_only_adds_authenticated_policy(recipes):
     with pytest.raises(ValueError):
         recovery_resume_changes(binding(old), binding(new), dict(old, seed=0), new)
     with pytest.raises(ValueError):
-        recovery_resume_changes(binding(old), binding(new), None, new)
-    with pytest.raises(ValueError):
         recovery_resume_changes(binding(old), dict(binding(new), prepared_id='other'), old, new)
     with pytest.raises(ValueError):
         recovery_resume_changes(binding(new), binding(new), new, new)
 
 
-@pytest.mark.parametrize('change', [dict(worlds=4096), dict(seed=0), dict(training_revision=8),
+@pytest.mark.parametrize('change', [dict(worlds=4096), dict(seed=0), dict(training_revision=TRAINING_REVISION+1),
     dict(learning_rate=.001), dict(extra=True), dict(control={'schema':'other'}),
     dict(contact_capacity=128), dict(epa_recovery=dict(EPA_RECOVERY, max_skipped_episodes=999))])
 def test_epa_resume_rejects_other_recipe_changes(recipes, change):

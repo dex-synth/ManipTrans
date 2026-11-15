@@ -9,17 +9,15 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
-from .robot import FIT_WEIGHTS, initial_qpos, object_roots
+from .clock import DECIMATION, PHYSICS_DT_S, training_ticks
+from .physics import MAX_PENETRATION_M
+from .robot import FIT_WEIGHTS, initial_qpos
 
 
-def fit(task_path, task, robot, arrays, initial, iterations, device):
+def fit(task, robot, arrays, initial, iterations, device):
     import pytorch_kinematics as pk
     import torch
-    import yaml
-    manifest_path = task_path / "scene/robot/assets/manifest.yaml"
-    manifest = yaml.safe_load(manifest_path.read_text())
-    path = manifest_path.parent / manifest["entrypoints"][task["robot_name"]]["urdf"]
-    tree = ET.fromstring(path.read_bytes())
+    tree = ET.fromstring(task.robot.urdf.read_bytes())
     for limit in tree.iter("limit"):
         limit.attrib.setdefault("effort", "0")
         limit.attrib.setdefault("velocity", "0")
@@ -30,7 +28,7 @@ def fit(task_path, task, robot, arrays, initial, iterations, device):
         raise ValueError("URDF differs from sealed robot")
     order = [names.index(n) for n in parameters]
     bodies = [b for s in robot["sides"] for b in robot["hands"][s]["bodies"]]
-    model = mujoco.MjModel.from_xml_path(str(task_path / task["scene"]))
+    model = mujoco.MjModel.from_xml_path(str(task.scene_xml))
     data = mujoco.MjData(model)
     data.qpos[:] = initial_qpos(model, task)
     probe = np.random.default_rng(0).uniform(-.05, .05, len(names))
@@ -118,11 +116,10 @@ def states(model, task, robot, reference, optimized):
         optimized[:, robot["hands"][side]["indices"][:6]] = wrist.solve(np.asarray(poses), np.asarray(rotations))
     qpos = np.broadcast_to(initial_qpos(model, task), (len(times), model.nq)).copy()
     qpos[:, robot["qpos_indices"]] = optimized
-    parts = list(task["object"]["parts"])
-    for root in object_roots(task).values():
-        if root["joint"] is None:
-            continue
-        names = [p for p, b in task["object"]["parts"].items() if b == root["body"]]
+    binding = task.object_binding
+    parts = list(binding["parts"])
+    for root in binding["roots"].values():  # Free roots only; a fixed root has no state.
+        names = [p for p, b in binding["parts"].items() if b == root["body"]]
         if len(names) != 1:
             raise ValueError("Object root must have a named reference part")
         index = parts.index(names[0])
@@ -132,7 +129,7 @@ def states(model, task, robot, reference, optimized):
         for i in range(1, len(times)):
             if np.dot(qpos[i-1, adr+3:adr+7], qpos[i, adr+3:adr+7]) < 0:
                 qpos[i, adr+3:adr+7] *= -1
-    for j, name in enumerate(task["object"]["joints"].values()):
+    for j, name in enumerate(binding["joints"].values()):
         qpos[:, int(model.joint(name).qposadr[0])] = reference["object_q"][:, j]
     qvel = np.empty((len(times), model.nv))
     for i in range(len(times)):
@@ -145,14 +142,14 @@ def states(model, task, robot, reference, optimized):
 def validate(model, task, robot, reference, qpos, surfaces):
     data = mujoco.MjData(model)
     valid, reasons = np.ones(len(qpos), dtype=bool), []
-    max_penetration = task["initialization"]["max_penetration_m"]
+    parts = list(task.object_binding["parts"])
     for i, pose in enumerate(qpos):
         data.qpos[:] = pose
         mujoco.mj_forward(model, data)
         problems = []
         if not np.isfinite(pose).all():
             problems.append("nonfinite")
-        if any(-float(c.dist) > max_penetration for c in data.contact):
+        if any(-float(c.dist) > MAX_PENETRATION_M for c in data.contact):
             problems.append("penetration")
         for j in range(model.njnt):
             if model.jnt_limited[j]:
@@ -161,8 +158,7 @@ def validate(model, task, robot, reference, qpos, surfaces):
                     problems.append("joint_limit")
         world = []
         for part, vertices in surfaces.items():
-            part_index = list(task["object"]["parts"]).index(part)
-            obj = reference["object_state"][i, part_index]
+            obj = reference["object_state"][i, parts.index(part)]
             world.append(vertices@Rotation.from_quat(obj[3:7], scalar_first=True).as_matrix().T+obj[:3])
         tree = cKDTree(np.concatenate(world))
         for side in robot["sides"]:
@@ -174,8 +170,8 @@ def validate(model, task, robot, reference, qpos, surfaces):
         reasons.append(problems)
         valid[i] = not problems
     # RSI starts only at control boundaries and must leave a nonempty suffix.
-    ticks = np.rint(reference["time_s"]*120).astype(np.int64)
-    valid &= (ticks % 2 == 0) & (ticks < task["end_tick"])
+    ticks = np.rint(reference["time_s"]/PHYSICS_DT_S).astype(np.int64)
+    valid &= (ticks % DECIMATION == 0) & (ticks < training_ticks(task.duration_s))
     return valid, reasons
 
 

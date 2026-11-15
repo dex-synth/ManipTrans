@@ -1,6 +1,7 @@
 """Single-hand models and named compatibility signatures from sealed physics."""
 
 from copy import deepcopy
+import math
 from pathlib import Path
 import shutil
 import tempfile
@@ -8,16 +9,12 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from .io import digest, sha256
+from .clock import CONTROL_DT_S, PHYSICS_DT_S
+from .io import digest, sha256, write_json
 from .physics import OPTION_FIELDS, PHYSICS_FIELDS, equal, verify_sealed
 
-SIGNATURE_SCHEMA = "maniptrans-hand-physics-v2"
+SIGNATURE_SCHEMA = "maniptrans-hand-physics-v3"
 REFERENCE_SCHEMA = "hand-reference-v3"
-
-
-def require_compatibility(value):
-    if value.get("schema") != SIGNATURE_SCHEMA or value.get("reference_schema") != REFERENCE_SCHEMA:
-        raise ValueError("Re-prepare references and retrain bases with the current wrist/physics schema")
 
 
 def check_hand_constraints(model, ids):
@@ -51,16 +48,24 @@ def check_hand_constraints(model, ids):
         raise ValueError("Unsupported explicit hand contact pair in physics signature")
 
 
-def require_clock(task):
-    if not np.isclose(task["dt_s"], 1/120, rtol=0, atol=1e-12) or task["control_ticks"] != 2:
-        raise ValueError("v2 requires a new sealed task with --physics-hz 120 --control-hz 60")
+def same_signature(a, b):
+    """Whether two signatures describe the same hand physics, reference and clocks.
 
+    The same hand compiled inside different scenes (a bimanual or a single-hand robot package)
+    can differ in the last bits of derived values such as actuator damping, so numbers are
+    compared up to compile roundoff and the content hashes are left out.
+    """
+    def same(x, y):
+        if isinstance(x, dict):
+            return isinstance(y, dict) and x.keys() == y.keys() and all(same(x[k], y[k]) for k in x)
+        if isinstance(x, list):
+            return isinstance(y, list) and len(x) == len(y) and all(same(i, j) for i, j in zip(x, y))
+        if isinstance(x, float) and isinstance(y, float):
+            return math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-12)
+        return x == y
 
-def require_contacts(task):
-    observation = task["observation"]
-    if (not observation.get("contacts") or observation.get("contact_schema") != "h2r-body-contacts-v1"
-            or observation.get("contact_coverage") != "robot-all-v1"):
-        raise ValueError("Native-aligned training requires a new task with robot-all-v1 contact coverage")
+    hashes = ("robot_physics_id", "physics_options_id")
+    return same({k: v for k, v in a.items() if k not in hashes}, {k: v for k, v in b.items() if k not in hashes})
 
 
 def hand_ids(model, robot, side):
@@ -121,24 +126,25 @@ def signature(model, robot, side):
     option_names = (*OPTION_FIELDS, "jacobian", "disableactuator", "noslip_iterations", "noslip_tolerance",
                     "o_margin", "o_solref", "o_solimp", "o_friction", "sdf_initpoints", "sdf_iterations", "sleep_tolerance")
     options = {n: np.asarray(getattr(model.opt, n)).tolist() for n in option_names}
+    # A base is trained at the method's own step, whatever nominal step the task model carries.
+    options["timestep"] = PHYSICS_DT_S
     # Keep the prepared position-actuator signature stable. Policy decoding is
     # bound separately by the trained artifact's control recipe.
     return dict(schema=SIGNATURE_SCHEMA, robot_physics_id=digest(fields), physics_options_id=digest(options),
-                physics_dt_s=1/120, control_dt_s=1/60, decimation=2,
+                physics_dt_s=PHYSICS_DT_S, control_dt_s=CONTROL_DT_S,
                 reference_schema=REFERENCE_SCHEMA, control_schema="virtual-wrist-position-v2",
                 feature_schema="maniptrans-h2r-hand-v2", fields=fields, options=options)
 
 
-def extract_hand(task_path, task, robot, side, output):
-    """Expand includes, retain fixed ancestors, and materialize actuator gains."""
+def extract_hand(task, robot, side, output):
+    """One hand of the task scene, stepped at the training step: expand includes, retain fixed
+    ancestors, and materialize actuator gains."""
     import mujoco
-    from .io import read_json, write_json
-    require_clock(task)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    source = task_path / task["scene"]
+    source = task.scene_xml
     model = mujoco.MjModel.from_xml_path(str(source))
-    verify_sealed(model, read_json(task_path / "scene/compiled.json"))
+    verify_sealed(model, task.compiled)
     ids = hand_ids(model, robot, side)
     body_names = {model.body(i).name for i in ids["body"]}
     joint_names = {model.joint(i).name for i in ids["jnt"]}
@@ -147,7 +153,7 @@ def extract_hand(task_path, task, robot, side, output):
         mujoco.mj_saveLastXML(str(expanded), model)
         tree = ET.parse(expanded)
     root = tree.getroot()
-    root.find("option").set("timestep", repr(task["dt_s"]))
+    root.find("option").set("timestep", repr(PHYSICS_DT_S))
     for name in ("keyframe", "sensor", "size"):
         for child in root.findall(name):
             root.remove(child)

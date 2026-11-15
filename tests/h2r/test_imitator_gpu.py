@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 import torch
 
+# A check corpus exported with --allow-incomplete needs H2R_IMITATOR_ALLOW_PARTIAL=1.
+PARTIAL = os.environ.get('H2R_IMITATOR_ALLOW_PARTIAL') == '1'
+
 
 def test_repeated_diagnostic_worlds_preserve_the_training_stream():
     prepared = os.environ.get('H2R_IMITATOR_PREPARED')
@@ -14,10 +17,10 @@ def test_repeated_diagnostic_worlds_preserve_the_training_stream():
         pytest.skip('set H2R_IMITATOR_PREPARED to run the CUDA environment lifecycle check')
     from maniptrans_h2r.imitator_env import ImitatorEnv
 
-    env = ImitatorEnv(Path(prepared), 2, 'cuda:0')
+    env = ImitatorEnv(Path(prepared), 2, 'cuda:0', allow_partial=PARTIAL)
     actions = torch.zeros(2, env.action_dim, device='cuda:0')
     for _ in range(4):
-        diagnostic = ImitatorEnv(Path(prepared), 2, 'cuda:0')
+        diagnostic = ImitatorEnv(Path(prepared), 2, 'cuda:0', allow_partial=PARTIAL)
         assert diagnostic.warp_stream is env.warp_stream
         diagnostic.step(actions)
         torch.cuda.synchronize()
@@ -73,7 +76,7 @@ def test_epa_skip_preserves_other_worlds_and_resets_only_completed_episodes(tmp_
     from maniptrans_h2r.buffers import OverflowType
     from maniptrans_h2r.recovery import EpaRecovery, STATE_KEYS
 
-    env = ImitatorEnv(Path(prepared), 4, 'cuda:0', seed=42, epa_recovery=EpaRecovery(tmp_path))
+    env = ImitatorEnv(Path(prepared), 4, 'cuda:0', seed=42, allow_partial=PARTIAL, epa_recovery=EpaRecovery(tmp_path))
     actions = torch.zeros(4, env.action_dim, device='cuda:0')
     healthy = torch.tensor([0, 2, 3], device='cuda:0')
     start_ticks = env.tick.clone()
@@ -151,7 +154,7 @@ def test_diagnostic_retains_epa_failed_windows_in_denominator(tmp_path, monkeypa
             pass
         def __call__(self, inputs):
             return {'mus':torch.zeros(2, 28, device='cuda:0')}
-    report = diagnostic.tracking(ZeroPolicy(), path, 'cuda:0', False, epa_recovery=EpaRecovery(tmp_path))
+    report = diagnostic.tracking(ZeroPolicy(), path, 'cuda:0', PARTIAL, epa_recovery=EpaRecovery(tmp_path))
     assert report['count'] == 2 and len(report['windows']) == 2
     failed = next(row for row in report['windows'] if row['simulation_error'])
     assert not failed['success'] and failed['failure_reasons'] == ['EPA_HORIZON']

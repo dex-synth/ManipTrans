@@ -1,4 +1,4 @@
-"""Portable, content-checked inputs. No simulator or dataset runtime imports."""
+"""Content-checked method artifacts. Tasks are read by the vendored h2r_io loader."""
 
 import hashlib
 import json
@@ -55,47 +55,18 @@ def check_files(root, files):
             raise ValueError(f"Changed dependency: {name}")
 
 
-def load_task(root):
-    root = Path(root).resolve()
-    task = read_json(root / "task.json")
-    identity = task.pop("task_id")
-    if task["format"] not in {f"h2r-evaluation-v{i}" for i in (1, 2, 3)}:
-        raise ValueError("Unsupported task format")
-    if digest(task) != identity:
-        raise ValueError("Changed task identity")
-    task["task_id"] = identity
-    check_files(root, task["files"])
-    for required in (task["scene"], "reference.json", "reference.npz"):
-        if required not in task["files"]:
-            raise ValueError(f"Unsealed task dependency: {required}")
-    if not task["observation"]["contacts"]:
-        raise ValueError("ManipTrans requires a common task prepared with --contacts")
-    if task["observation"].get("contact_schema") != "h2r-body-contacts-v1":
-        raise ValueError("Unsupported contact observations")
-    return root, task
+# Manifest file and format of each artifact. Earlier versions were built from the former task
+# format, protocol and inherited training step; they are rejected, not converted.
+ARTIFACTS = dict(pretrain=("prepared.json", "maniptrans-h2r-pretrain-v2"),
+                 imitator=("imitator.json", "maniptrans-h2r-imitator-v2"),
+                 prepared=("prepared.json", "maniptrans-h2r-prepared-v3"),
+                 deployment=("deployment.json", "maniptrans-h2r-deployment-v3"))
 
 
-def check_inputs(bundle, robot, task_path, task):
-    bundle, robot = Path(bundle).resolve(), Path(robot).resolve()
-    manifest = read_json(bundle / "bundle.json")
-    if manifest.get("kind", "physical") != "physical":
-        raise ValueError("A physical preprocessing bundle is required")
-    if manifest["format"] not in {f"h2r-preprocess-v{i}" for i in (1, 2, 3)}:
-        raise ValueError("Unsupported bundle format")
-    check_files(bundle, manifest["files"])
-    if digest(manifest["files"]) != manifest["bundle_id"] or manifest["bundle_id"] != task["bundle_id"]:
-        raise ValueError("Bundle and task identities differ")
-    if sha256(robot / "robot.json") != task["robot_manifest_sha256"]:
-        raise ValueError("Robot and task identities differ")
-    check_files(robot, read_json(robot / "robot.json")["files_sha256"])
-    for name in ("reference.json", "reference.npz"):
-        if sha256(bundle / name) != sha256(task_path / name):
-            raise ValueError(f"Task reference differs from bundle: {name}")
-
-
-def seal(root, name, metadata):
+def seal(root, kind, metadata):
     root = Path(root)
-    result = dict(metadata)
+    name, format = ARTIFACTS[kind]
+    result = dict(format=format, **metadata)
     result["files"] = {str(p.relative_to(root)): sha256(p) for p in sorted(root.rglob("*"))
                        if p.is_file() and p != root / name}
     result["id"] = digest(result)
@@ -103,9 +74,13 @@ def seal(root, name, metadata):
     return result
 
 
-def load_artifact(root, name="prepared.json"):
+def load_artifact(root, kind):
     root = Path(root).resolve()
+    name, format = ARTIFACTS[kind]
     metadata = read_json(root / name)
+    if metadata.get("format") != format:
+        raise ValueError(f"{root.name}/{name} has format {metadata.get('format')!r}, this version reads {format!r}. "
+                         "Artifacts made for an earlier task format cannot be reused: prepare and train again")
     identity = metadata.pop("id")
     if digest(metadata) != identity:
         raise ValueError(f"Changed {name} identity")

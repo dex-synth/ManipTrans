@@ -5,35 +5,38 @@ import numpy as np
 FINGERS = ("thumb", "index", "middle", "ring", "pinky")
 MANO_ORDER = [0, 13, 14, 15, 16, 1, 2, 3, 17, 4, 5, 6, 18, 10, 11, 12, 19, 7, 8, 9, 20]
 FIT_WEIGHTS = [1, 1, 1, 1, 25, 1, 1, 1, 20, 1, 1, 1, 10, 1, 1, 1, 7, 1, 1, 1, 5]
+SIDES = ("right", "left")  # Feature and action order of a bimanual policy.
+
+
+def tracked_links(robot_name):
+    """Per finger, the four links matched to MANO keypoints; this table is the method's own."""
+    if robot_name != "sharpa_wave":
+        raise ValueError(f"No ManipTrans keypoint correspondence for robot {robot_name!r}; implemented: sharpa_wave")
+    return {finger: ("MC", "PP", "DP", "fingertip") if finger == "thumb" else ("PP", "MP", "DP", "fingertip")
+            for finger in FINGERS}
 
 
 def mapping(model, task):
+    """Joint, body and actuator indices of the task's hands in the task model."""
     import mujoco
 
-    if task["robot_name"] not in {"virtual_wrist_sharpa_wave_right", "virtual_wrist_sharpa_wave_bimanual"}:
-        raise ValueError("Currently implemented robot: common Sharpa Wave (right or bimanual)")
-    semantics = task["semantics"]
-    for joint in task["object"]["joints"].values():
+    links, semantics = tracked_links(task.robot.name), task.robot.semantics
+    for joint in task.object_binding["joints"].values():
         if int(model.joint(joint).type[0]) != int(mujoco.mjtJoint.mjJNT_HINGE):
             raise ValueError("Only scalar passive hinge object joints are currently supported")
-    sides = [s for s in ("right", "left") if s in semantics["hands"]]
-    if set(sides) != set(task.get("hand_sides", sides)):
-        raise ValueError("Task hands differ from robot hands")
+    sides = [side for side in SIDES if side in task.hand_sides]
     names = semantics["joint_names"]
     result = {"joint_names": names, "sides": sides, "hands": {}}
     for side in sides:
         hand = semantics["hands"][side]
-        wrist = [f"{side}_{a}_joint" for a in ("x", "y", "z", "roll", "pitch", "yaw")]
-        tracked = [hand["wrist_body"]]
-        for finger in FINGERS:
-            links = ("MC", "PP", "DP", "fingertip") if finger == "thumb" else ("PP", "MP", "DP", "fingertip")
-            tracked.extend(f"{side}_{finger}_{link}" for link in links)
+        if len(hand["wrist_translation_joints"]) != 3 or len(hand["wrist_rotation_joints"]) != 3:
+            raise ValueError("The wrist action needs three translation and three rotation joints")
+        tracked = [hand["wrist_body"]] + [f"{side}_{finger}_{link}" for finger in FINGERS for link in links[finger]]
         contact = [f"{side}_{finger}_DP" for finger in FINGERS]
         for body in tracked + contact:
             model.body(body)  # Fail before training on missing correspondence.
-        ordered = wrist + hand["finger_joints"]
-        indices = [names.index(n) for n in ordered]
-        result["hands"][side] = dict(joints=ordered, indices=indices, bodies=tracked,
+        ordered = hand["wrist_translation_joints"] + hand["wrist_rotation_joints"] + hand["finger_joints"]
+        result["hands"][side] = dict(joints=ordered, indices=[names.index(n) for n in ordered], bodies=tracked,
                                      contact_bodies=contact, mano_order=MANO_ORDER)
     if sorted(i for h in result["hands"].values() for i in h["indices"]) != list(range(len(names))):
         raise ValueError("Hand mappings must cover the entire common robot")
@@ -47,24 +50,15 @@ def mapping(model, task):
     return result
 
 
-def object_roots(task):
-    obj = task["object"]
-    if "roots" in obj:
-        return obj["roots"]
-    return {"object": {"body": obj["root_body"], "joint": obj.get("root_joint")}}
-
-
 def initial_qpos(model, task):
+    """The task's start state: objects at reference frame 0, the robot at the model default."""
     qpos = model.qpos0.copy()
-    initial = task["initialization"]
-    poses = initial.get("object_roots", {"object": initial.get("object_pose_wxyz")})
-    for name, root in object_roots(task).items():
-        if not root["joint"]:
-            continue
-        j = model.joint(root["joint"])
-        qpos[int(j.qposadr[0]):int(j.qposadr[0]) + 7] = poses[name]
-    for name, joint in task["object"]["joints"].items():
-        qpos[int(model.joint(joint).qposadr[0])] = initial["object_joints"][name]
+    binding, state = task.object_binding, task.initial_object_state
+    for name, root in binding["roots"].items():
+        address = int(model.joint(root["joint"]).qposadr[0])
+        qpos[address:address+7] = state["object_roots"][name]
+    for name, joint in binding["joints"].items():
+        qpos[int(model.joint(joint).qposadr[0])] = state["object_joints"][name]
     return qpos
 
 

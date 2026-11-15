@@ -1,4 +1,4 @@
-"""Persistent feedback controller for bench-owned physical evaluation."""
+"""Persistent feedback controller for bench-owned physical evaluation (protocol h2r-evaluation-v2)."""
 
 import argparse
 import socket
@@ -7,68 +7,69 @@ import time
 import torch
 
 from .control import PositionControl
-from .io import load_artifact, load_arrays, load_task, read_json, write_json
-from .observations import Features, Reference, protocol_state
+from .h2r_io import client
+from .io import load_artifact, load_arrays, read_json, sha256, write_json
+from .observations import Features, Reference, observed_bodies, protocol_state
 from .policy import Policy, build, resolve_bases
-from .protocol import receive, send
+
+FULL_CONTACTS = "robot-all-v1"
 
 
 class Controller:
     def __init__(self, deployment, device):
-        self.root, self.manifest = load_artifact(deployment, "deployment.json")
-        if self.manifest["format"] not in {"maniptrans-h2r-deployment-v1", "maniptrans-h2r-deployment-v2"}:
-            raise ValueError("Unsupported deployment format")
-        prepared, meta = load_artifact(self.root / "prepared")
+        self.root, self.manifest = load_artifact(deployment, "deployment")
+        prepared, meta = load_artifact(self.root / "prepared", "prepared")
         if meta["id"] != self.manifest["prepared_id"]:
             raise ValueError("Deployment reference binding differs")
-        _, self.task = load_task(prepared / "task")
-        if self.manifest.get("recipe", {}).get("training_revision", 0) >= 4:
-            from .robot_physics import require_contacts
-            require_contacts(self.task)
+        self.meta, self.device = meta, device
         self.robot = read_json(prepared / "robot_mapping.json")
         self.reference = Reference(load_arrays(prepared / "reference.npz"), device)
-        self.initial = self.reference.values["robot_q"][0:1]
-        if self.manifest["format"] == "maniptrans-h2r-deployment-v2":
-            initialization = read_json(prepared / "initialization.json")
-            if initialization["joint_names"] != self.robot["joint_names"]:
-                raise ValueError("Initial joint order differs")
-            self.initial = torch.tensor([initialization["robot_q"]], dtype=torch.float32, device=device)
-        self.features = Features(self.robot, meta["part_names"],
-            sum(v*v for v in read_json(prepared / "task/scene/compiled.json")["base_scene"]["options"]["gravity"])**0.5)
-        self.device = device
+        initialization = read_json(prepared / "initialization.json")
+        if initialization["joint_names"] != self.robot["joint_names"]:
+            raise ValueError("Initial joint order differs")
+        self.initial = torch.tensor([initialization["robot_q"]], dtype=torch.float32, device=device)
+        self.features = Features(self.robot, meta["part_names"], meta["gravity_m_s2"])
         params = resolve_bases(self.manifest["params"], self.root)
         self.model = build(params, self.manifest["dimensions"], self.manifest["action_dim"], device)
         checkpoint = torch.load(self.root / self.manifest["checkpoint"], map_location=device, weights_only=True)
         self.model.load_state_dict(checkpoint["model"])
+        self.control_dt_s = self.manifest["control_dt_s"]  # The policy's own period, as trained.
         self.controls, self.next_ticks = {}, {}
 
     def start(self, hello):
-        if hello.get("type") != "hello" or hello.get("protocol") != "h2r-evaluation-v1":
-            raise ValueError("Unsupported evaluation protocol")
-        for key in ("task_id", "bundle_id", "robot_manifest_sha256", "robot_name", "dt_s", "control_ticks", "end_tick", "object", "observation"):
-            if hello.get(key) != self.task[key]:
-                raise ValueError(f"Evaluation task differs: {key}")
-        if hello["joint_names"] != self.robot["joint_names"] or hello["joint_units"] != self.task["semantics"]["joint_units"]:
-            raise ValueError("Evaluation joint names/units differ")
+        if hello.get("type") != "hello" or hello.get("protocol") != client.PROTOCOL:
+            raise ValueError(f"Unsupported evaluation protocol {hello.get('protocol')!r}; this client speaks {client.PROTOCOL}")
+        if hello["task_id"] != self.manifest["task_id"]:
+            raise ValueError("The evaluator runs a different task than this deployment was prepared for")
+        observation = hello["observation"]
+        if not observation["contacts"] or observation.get("contact_coverage") != FULL_CONTACTS:
+            # The policy was trained on net fingertip forces from every partner, the robot included.
+            raise ValueError(f"ManipTrans needs {FULL_CONTACTS} contact observations, the evaluation announces "
+                             f"{observation.get('contact_coverage')!r}. Start evaluate-server with "
+                             "contact_sensing.include_robot_robot=true")
+        # The evaluation step is the evaluator's; only the control period is carried by the policy.
+        self.ticks, self.dt_s, self.end_tick = client.control_ticks(hello, self.control_dt_s), hello["dt_s"], hello["end_tick"]
+        self.orders = dict(robot=[hello["joint_names"].index(n) for n in self.robot["joint_names"]],
+                           object=[list(hello["object"]["joints"]).index(n) for n in self.meta["object_joint_names"]])
         seeds = {e["episode_id"]: e["controller_seed"] for e in hello["episodes"]}
         if len(seeds) != len(hello["episodes"]):
             raise ValueError("Duplicate episode identity")
         self.policy = Policy(self.model, self.manifest["action_dim"], seeds, self.device, self.manifest["residual_mean"])
-        initial = self.initial
         for identity in seeds:
             control = PositionControl(self.robot, 1, self.device, self.manifest["control"])
-            control.reset([0], initial)
+            control.reset([0], self.initial)
             self.controls[identity] = control
             self.next_ticks[identity] = 0
-        bodies = list(dict.fromkeys([b for h in self.robot["hands"].values() for b in h["bodies"]]
-                                    + list(self.task["object"]["parts"].values())))
-        if not set(bodies) <= set(hello["observation"]["bodies"]):
+        bodies = observed_bodies(self.robot, self.meta["object_bodies"])
+        if not set(bodies) <= set(observation["bodies"]):
             raise ValueError("Required body observations unavailable")
-        return dict(type="start", task_id=self.task["task_id"],
-            binding={"bundle_id": self.task["bundle_id"], "robot_manifest_sha256": self.task["robot_manifest_sha256"],
-                     "method": self.manifest["method"], "controller": self.manifest["id"]},
-            requirements=dict(bodies=bodies, contacts=True, control_dt_s=self.task["control_ticks"]*self.task["dt_s"]),
-            initial_robot={e: dict(zip(self.robot["joint_names"], initial[0].tolist())) for e in seeds})
+        checkpoint = self.root / self.manifest["checkpoint"]
+        return client.start_request(
+            hello, method=self.manifest["method"], control_dt_s=self.control_dt_s, bodies=bodies, contacts=True,
+            controller=dict(name=self.manifest["controller"], deployment_id=self.manifest["id"],
+                            checkpoint=str(checkpoint), checkpoint_sha256=sha256(checkpoint),
+                            **self.manifest["training"]),
+            initial_robot={e: dict(zip(self.robot["joint_names"], self.initial[0].tolist())) for e in seeds})
 
     @torch.no_grad()
     def step(self, message):
@@ -86,21 +87,22 @@ class Controller:
             raise ValueError("Duplicate episode frame")
         for frame in active:
             tick = frame["tick"]
-            if tick != self.next_ticks.get(frame["episode_id"]) or tick >= self.task["end_tick"]:
+            if tick != self.next_ticks.get(frame["episode_id"]) or tick >= self.end_tick:
                 raise ValueError("Unexpected control tick")
             if frame.get("contacts") is None or frame["contacts"]["solve_tick"] != (tick-1 if tick else None):
                 raise ValueError("Missing or mistimed contacts")
+        # As in training: observe now, track the reference one control period ahead (clamped to the end).
         ticks = torch.tensor([f["tick"] for f in active], device=self.device)
-        target = self.reference.sample((ticks+self.task["control_ticks"]).clamp(max=self.task["end_tick"])*self.task["dt_s"])
-        state = protocol_state(active, self.robot, self.task, self.device)
+        target = self.reference.sample((ticks+self.ticks).clamp(max=self.end_tick)*self.dt_s)
+        state = protocol_state(active, self.robot, self.meta["object_bodies"], self.orders, self.device)
         obs = self.features(state, target, self.robot["sides"], "residual")
         actions = self.policy(obs, identities)
         commands = {}
         for row, identity in enumerate(identities):
-            positions = self.controls[identity].decode(actions[row:row+1], target["robot_q"][row:row+1],
-                                                       self.robot["sides"], True, positions=state["robot_q"][row:row+1])[0]
+            positions = self.controls[identity].decode(actions[row:row+1], self.robot["sides"], True,
+                                                       state["robot_q"][row:row+1])[0]
             commands[identity] = dict(tick=active[row]["tick"], joint_targets=dict(zip(self.robot["joint_names"], positions.tolist())))
-            self.next_ticks[identity] = min(active[row]["tick"]+self.task["control_ticks"], self.task["end_tick"])
+            self.next_ticks[identity] = min(active[row]["tick"]+self.ticks, self.end_tick)
         return dict(type="step", commands=commands)
 
 
@@ -125,13 +127,15 @@ def main():
                 if time.monotonic()-started >= args.timeout_s:
                     raise TimeoutError("Evaluation server did not start")
                 time.sleep(0.2)
-        send(stream, controller.start(receive(stream)))
+        client.send(stream, controller.start(client.receive(stream)))
         while True:
-            frames = receive(stream)
+            frames = client.receive(stream)
             command = controller.step(frames)
             if command is None:
                 break
-            send(stream, command)
+            client.send(stream, command)
+    for episode in frames["episodes"]:
+        print(f"episode {episode['episode_id']} (seed {episode['seed']}): {episode.get('reason')} at tick {episode['tick']}")
     if args.diagnostics:
         write_json(args.diagnostics, dict(deployment_id=controller.manifest["id"],
                    elapsed_s=time.monotonic()-started, episodes=frames["episodes"]))

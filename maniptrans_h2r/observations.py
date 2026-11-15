@@ -120,15 +120,21 @@ class Features:
         return {key: torch.cat([v[key] for v in values], -1).clamp(-5, 5) for key in values[0]}
 
 
-def protocol_state(frames, robot, task, device):
+def observed_bodies(robot, object_bodies):
+    """Every body the features read: the tracked hand links, then the object parts."""
+    return list(dict.fromkeys([b for h in robot["hands"].values() for b in h["bodies"]] + list(object_bodies)))
+
+
+def protocol_state(frames, robot, object_bodies, orders, device):
+    """Evaluation frames as the training state. `orders` maps the method's robot and object joint
+    order into the announced one; contact records become the net force on each fingertip."""
     def tensor(values):
         return torch.as_tensor(values, dtype=torch.float32, device=device)
 
-    bodies = list(dict.fromkeys([b for h in robot["hands"].values() for b in h["bodies"]]
-                               + list(task["object"]["parts"].values())))
-    state = {key: tensor([f[key] for f in frames]) for key in ("robot_q", "robot_dq", "object_q", "object_dq")}
-    state["bodies"] = {b: tensor([f["bodies"][b] for f in frames]) for b in bodies}
-    state["objects"] = torch.stack([state["bodies"][b] for b in task["object"]["parts"].values()], dim=1)
+    state = {key: tensor([f[key] for f in frames])[:, orders[key.split("_")[0]]]
+             for key in ("robot_q", "robot_dq", "object_q", "object_dq")}
+    state["bodies"] = {b: tensor([f["bodies"][b] for f in frames]) for b in observed_bodies(robot, object_bodies)}
+    state["objects"] = torch.stack([state["bodies"][b] for b in object_bodies], dim=1)
     state["tip_force"] = {s: torch.zeros((len(frames), 5, 3), device=device) for s in robot["sides"]}
     lookup = {b: (s, i) for s in robot["sides"] for i, b in enumerate(robot["hands"][s]["contact_bodies"])}
     for row, frame in enumerate(frames):

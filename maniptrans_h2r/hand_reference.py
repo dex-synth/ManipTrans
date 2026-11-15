@@ -1,17 +1,13 @@
 """Canonical hand targets, MANO interpolation and continuous virtual-wrist IK."""
 
-from contextlib import contextmanager
-from functools import lru_cache
-import inspect
 import warnings
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation, Slerp
 
+from .h2r_io import mano
 from .robot import MANO_ORDER
-
-CONTROL_DT = 1/60
 
 
 class WristLimitError(ValueError):
@@ -221,38 +217,6 @@ def reference_values(human, q, quat, times, side):
             "wrist_q": q.astype(np.float32)}
 
 
-@contextmanager
-def legacy_mano():
-    aliases = dict(bool=bool, int=int, float=float, complex=complex, object=object, unicode=str, str=str)
-    added = {k: v for k, v in aliases.items() if k not in np.__dict__}
-    old = getattr(inspect, "getargspec", None)
-    try:
-        for k, v in added.items():
-            setattr(np, k, v)
-        if old is None:
-            inspect.getargspec = inspect.getfullargspec
-        yield
-    finally:
-        for k in added:
-            delattr(np, k)
-        if old is None:
-            delattr(inspect, "getargspec")
-
-
-@lru_cache(maxsize=4)
-def mano_model(directory, side, fix):
-    import smplx
-    import torch
-    with legacy_mano():
-        model = smplx.MANO(directory, is_rhand=side == "right", use_pca=False,
-                           flat_hand_mean=True, create_transl=False).eval()
-    if fix and side == "left":
-        right = mano_model(directory, "right", False)
-        if torch.sum(torch.abs(model.shapedirs[:, 0]-right.shapedirs[:, 0])) < 1:
-            model.shapedirs[:, 0] *= -1
-    return model
-
-
 def interpolation_times(times, source_times):
     """Snap sub-nanosecond endpoint roundoff, but reject real extrapolation."""
     times = np.asarray(times, dtype=np.float64)
@@ -263,7 +227,8 @@ def interpolation_times(times, source_times):
 
 
 class MotionInterpolator:
-    """Reuse source SLERP objects across real and synthetic queries of one clip."""
+    """SLERP the absolute MANO rotations of one corpus clip, decode them with the common decoder
+    and anchor the hand at the interpolated wrist. Source SLERP objects are reused across queries."""
 
     def __init__(self, arrays, metadata, mano_dir):
         self.arrays, self.metadata, self.mano_dir = arrays, metadata, mano_dir
@@ -272,7 +237,7 @@ class MotionInterpolator:
         quat = np.concatenate([arrays["wrist_quat_wxyz"][:, None], arrays["local_quat_wxyz"]], axis=1)
         self.rotations = [Slerp(self.times, Rotation.from_quat(quat[:, j], scalar_first=True)) for j in range(16)]
 
-    def __call__(self, times, *, endpoints=None, mirror=False):
+    def __call__(self, times, *, endpoints=None):
         source_times, positions, rotations = self.times, self.positions, self.rotations
         if endpoints is not None:
             endpoints = interpolation_times(endpoints, source_times)
@@ -282,29 +247,7 @@ class MotionInterpolator:
             rotations = [Slerp(source_times, Rotation.from_quat(r(endpoints).as_quat(scalar_first=True), scalar_first=True))
                          for r in rotations]
         times = interpolation_times(times, source_times)
-        angles = np.stack([r(times).as_rotvec() for r in rotations], axis=1).reshape(-1, 48)
+        quat = np.stack([r(times).as_quat(scalar_first=True) for r in rotations], axis=1)
         wrist = np.stack([np.interp(times, source_times, positions[:, j]) for j in range(3)], axis=-1)
-        return decode_motion(self.arrays, self.metadata, angles, wrist, self.mano_dir, mirror=mirror)
-
-
-def decode_motion(arrays, metadata, poses, wrist, mano_dir, *, mirror=False):
-    """Decode batched MANO poses and anchor them to the source wrist."""
-    import torch
-    model = mano_model(str(mano_dir), metadata["source_side"], metadata["hot3d_shapedirs_fix"])
-    result = []
-    with torch.inference_mode():
-        for start in range(0, len(poses), 256):
-            angles = torch.tensor(poses[start:start+256], dtype=torch.float32)
-            out = model(global_orient=angles[:, :3], hand_pose=angles[:, 3:],
-                        betas=torch.tensor(np.broadcast_to(arrays["betas"], (len(angles), 10)).copy(), dtype=torch.float32))
-            joints = torch.cat([out.joints[:, :16], out.vertices[:, metadata["tip_vertex_ids"]]], dim=1)
-            result.append((joints-joints[:, :1]).numpy()+wrist[start:start+256, None])
-    result = np.concatenate(result)
-    if mirror:
-        result[..., 0] *= -1
-    return result.astype(np.float32)
-
-
-def interpolate_motion(arrays, metadata, times, mano_dir, *, endpoints=None, mirror=False):
-    """SLERP absolute MANO rotations, decode, then anchor to the real wrist."""
-    return MotionInterpolator(arrays, metadata, mano_dir)(times, endpoints=endpoints, mirror=mirror)
+        return mano.decode(self.mano_dir, self.metadata["source_side"], quat, wrist, self.arrays["betas"],
+                           left_shapedirs_x_mirrored=self.metadata["hot3d_shapedirs_fix"])["joints_m"]

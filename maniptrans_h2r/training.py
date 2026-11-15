@@ -17,12 +17,15 @@ from rl_games.common.tr_helpers import DefaultRewardsShaper
 from lib.rl.agent import PPOAgent
 from lib.rl.numerics import enable_checks, require_finite
 from .buffers import CAPACITY_KEYS, SimulationOverflow, capacities
+from .clock import CONTROL_DT_S, PHYSICS_DT_S
 from .control import CONTROL
 from .io import digest, load_artifact, read_json, seal, sha256, write_json
 from .policy import parameters, register
 from .recovery import EPA_RECOVERY, EpaRecovery
+from .robot_physics import same_signature
 
-TRAINING_REVISION = 7
+# 8: training sets its own physics step instead of inheriting the task's, and binds tasks by task_id.
+TRAINING_REVISION = 8
 
 def training_arguments(parser, stage):
     defaults = yaml.safe_load((Path(__file__).parent / "config" / f"{stage}.yaml").read_text())
@@ -40,8 +43,6 @@ def training_arguments(parser, stage):
     parser.add_argument("--resume", type=Path, help="Trusted local resume.pth at a complete PPO epoch")
     parser.add_argument("--allow-capacity-increase", action="store_true",
                         help="Allow only increased contact/constraint buffers when resuming")
-    parser.add_argument("--resume-config", type=Path,
-                        help="Original resolved_config.yaml for a legacy checkpoint without an embedded recipe")
     if stage == "imitator":
         parser.add_argument("--recover-epa", action="store_true",
                             help="Opt in to bounded EPA episode skips, including when resuming a strict run")
@@ -67,14 +68,14 @@ def recipe_identity(recipe):
 
 
 def training_capacities(args):
-    if not args.resume and (args.allow_capacity_increase or args.resume_config):
-        raise ValueError("Resume options require --resume")
+    if not args.resume and args.allow_capacity_increase:
+        raise ValueError("--allow-capacity-increase requires --resume")
     return capacities({key: getattr(args, key) for key in CAPACITY_KEYS})
 
 
 def capacity_resume_changes(old_binding, binding, old_recipe, recipe):
     """Verify the old recipe hash before allowing allocation-only increases."""
-    if old_recipe is None or digest(recipe_identity(old_recipe)) != old_binding["recipe_id"]:
+    if digest(recipe_identity(old_recipe)) != old_binding["recipe_id"]:
         raise ValueError("Capacity resume requires the checkpoint's hash-matching original recipe")
     if digest(recipe_identity(recipe)) != binding["recipe_id"]:
         raise ValueError("Current resume recipe hash differs")
@@ -94,7 +95,7 @@ def recovery_resume_changes(old_binding, binding, old_recipe, recipe, allow_capa
     """Authenticate the strict run before adding this one versioned recovery policy."""
     if digest(recipe_identity(recipe)) != binding["recipe_id"]:
         raise ValueError("Current resume recipe hash differs")
-    if old_recipe is None or "epa_recovery" in old_recipe or recipe.get("epa_recovery") != EPA_RECOVERY:
+    if "epa_recovery" in old_recipe or recipe.get("epa_recovery") != EPA_RECOVERY:
         raise ValueError("EPA resume requires an original strict recipe and the supported recovery policy")
     strict_recipe = {k: v for k, v in recipe.items() if k != "epa_recovery"}
     strict_binding = dict(binding, recipe_id=digest(recipe_identity(strict_recipe)))
@@ -180,25 +181,21 @@ class ReproductionAgent(PPOAgent):
             state["h2r"]["epa_recovery"] = self.vec_env.epa_recovery.state_dict()
         return state
 
-    def restore_local(self, path, *, allow_capacity_increase=False, resume_config=None, recover_epa=False):
+    def restore_local(self, path, *, allow_capacity_increase=False, recover_epa=False):
         state = torch.load(path, map_location=self.ppo_device, weights_only=False)
         extra = state["h2r"]
-        old_recipe = extra.get("recipe")
-        if old_recipe is not None and digest(recipe_identity(old_recipe)) != extra["binding"]["recipe_id"]:
+        old_recipe = extra.get("recipe", {})
+        if old_recipe.get("training_revision") != TRAINING_REVISION:
+            raise ValueError(f"Checkpoint of training revision {old_recipe.get('training_revision')}; this version "
+                             f"resumes revision {TRAINING_REVISION} only. Earlier checkpoints cannot be continued")
+        if digest(recipe_identity(old_recipe)) != extra["binding"]["recipe_id"]:
             raise ValueError("Embedded resume recipe does not match checkpoint recipe hash")
-        if resume_config is not None:
-            supplied = yaml.safe_load(Path(resume_config).read_text())
-            if digest(recipe_identity(supplied)) != extra["binding"]["recipe_id"]:
-                raise ValueError("Original resume config does not match checkpoint recipe hash")
-            if old_recipe is not None and recipe_identity(old_recipe) != recipe_identity(supplied):
-                raise ValueError("Supplied and embedded resume recipes differ")
-            old_recipe = supplied
-        if old_recipe is not None and old_recipe.get("epa_recovery") and "epa_recovery" not in extra:
+        if old_recipe.get("epa_recovery") and "epa_recovery" not in extra:
             raise ValueError("EPA resume checkpoint is missing recovery counters")
         changes = {}
         recovery_changes = {}
         if extra["binding"] != self.binding:
-            if recover_epa and (old_recipe is None or "epa_recovery" not in old_recipe):
+            if recover_epa and "epa_recovery" not in old_recipe:
                 changes = recovery_resume_changes(extra["binding"], self.binding, old_recipe, self.recipe, allow_capacity_increase)
                 recovery_changes = dict(before=None, after=deepcopy(EPA_RECOVERY))
             elif allow_capacity_increase:
@@ -284,7 +281,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
         recipe[key] = getattr(args, key)
     recipe.update(small_network=args.small_network, partial=prepared_meta.get("partial", False),
                   training_framework="mjlab", physics_engine="mujoco_warp", training_revision=TRAINING_REVISION, base_sampling="native-resample",
-                  control=dict(CONTROL),
+                  control=dict(CONTROL), control_dt_s=CONTROL_DT_S, physics_dt_s=PHYSICS_DT_S,
                   native_config_source="main/cfg/config.yaml + task and rl_train stage defaults",
                   budget_source="H2R explicit limits")
     if args.stage == "imitator":
@@ -322,7 +319,7 @@ def run_training(env, params, args, output, prepared_meta, base_ids=None, diagno
     agent = ReproductionAgent(params, output, recipe, binding, diagnostic)
     if args.resume:
         agent.restore_local(args.resume, allow_capacity_increase=args.allow_capacity_increase,
-                            resume_config=args.resume_config, recover_epa=getattr(args, "recover_epa", False))
+                            recover_epa=getattr(args, "recover_epa", False))
         if agent.epoch_num >= args.epochs:
             raise ValueError("Resume epoch must be below requested total --epochs")
     before = {k: v.detach().clone() for k, v in agent.model.named_parameters() if v.requires_grad}
@@ -362,7 +359,7 @@ def train_imitator(args):
     torch.set_num_threads(4)
     limits = training_capacities(args)
     seed_all(args.seed)
-    prepared, metadata = load_artifact(args.prepared)
+    prepared, metadata = load_artifact(args.prepared, "pretrain")
     output = Path(args.output).resolve()
     if output.is_relative_to(prepared):
         raise ValueError("Output must be outside prepared inputs")
@@ -378,7 +375,7 @@ def train_imitator(args):
     for name in ("robot_mapping.json", "compatibility.json", "motion_manifest.json", "diagnostic_manifest.json", "robot_scene.xml"):
         shutil.copy2(prepared / name, output / name)
     shutil.copytree(prepared / "assets", output / "assets")
-    seal(output, "imitator.json", dict(format="maniptrans-h2r-imitator-v1", side=metadata["side"],
+    seal(output, "imitator", dict(side=metadata["side"],
         prepared_id=metadata["id"], corpus_id=metadata["corpus_id"], compatibility=metadata["compatibility"],
         control=CONTROL,
         smoke=bool(args.small_network or metadata["partial"]), params=saved, dimensions=dimensions,
@@ -392,21 +389,21 @@ def train_residual(args):
     torch.set_num_threads(4)
     limits = training_capacities(args)
     seed_all(args.seed)
-    prepared, metadata = load_artifact(args.prepared)
+    prepared, metadata = load_artifact(args.prepared, "prepared")
     robot = read_json(prepared / "robot_mapping.json")
     bases, manifests = {}, {}
     for side in robot["sides"]:
         path = getattr(args, f"imitator_{side}")
         if not path:
             raise ValueError(f"Residual training requires --imitator-{side}; no local base is trained implicitly")
-        root, manifest = load_artifact(path, "imitator.json")
-        if manifest["format"] != "maniptrans-h2r-imitator-v1" or manifest["side"] != side:
-            raise ValueError("Wrong imitator format or hand side")
-        if manifest.get("recipe", {}).get("training_revision") != TRAINING_REVISION:
-            raise ValueError("Retrain the base with the current wrist control and training revision")
+        root, manifest = load_artifact(path, "imitator")
+        if manifest["side"] != side:
+            raise ValueError(f"--imitator-{side} is a {manifest['side']} base")
+        if manifest["recipe"]["training_revision"] != TRAINING_REVISION:
+            raise ValueError("Retrain the base with the current training revision")
         if manifest["smoke"] and not args.allow_smoke_imitator:
             raise ValueError("Smoke base requires --allow-smoke-imitator")
-        if manifest["compatibility"] != metadata["compatibility"][side] or manifest["control"] != CONTROL:
+        if not same_signature(manifest["compatibility"], metadata["compatibility"][side]) or manifest["control"] != CONTROL:
             raise ValueError(f"Incompatible {side} base physics/reference/control signature")
         bases[side], manifests[side] = root, manifest
     output = Path(args.output).resolve()
@@ -440,10 +437,13 @@ def train_residual(args):
         if side in bases:
             saved["model"][f"{prefix}_base_model_checkpoint"] = f"{side}-base.pth"
             saved["network"]["base_model"][f"{prefix}_checkpoint"] = f"{side}-base.pth"
-    seal(output, "deployment.json", dict(format="maniptrans-h2r-deployment-v2", method="maniptrans-mjlab",
+    progress = read_json(output / "training.json")
+    seal(output, "deployment", dict(method="maniptrans-mjlab",
         controller=CONTROL["schema"], prepared_id=metadata["id"], task_id=metadata["task_id"],
-        bundle_id=metadata["bundle_id"], robot_manifest_sha256=metadata["robot_manifest_sha256"],
+        demo_id=metadata["demo_id"], robot_id=metadata["robot_id"],
         compatibility=metadata["compatibility"], params=saved, dimensions=dimensions, action_dim=env.action_dim,
-        checkpoint="model.pth", control=CONTROL, residual_mean=True, recipe=recipe,
+        checkpoint="model.pth", control=CONTROL, control_dt_s=CONTROL_DT_S, residual_mean=True, recipe=recipe,
+        training=dict(training_seed=args.seed, training_epochs=progress["epoch"],
+                      training_transitions=progress["transitions"]),
         bases={s: m["id"] for s, m in manifests.items()}))
     print(f"Residual deployment: {output}")

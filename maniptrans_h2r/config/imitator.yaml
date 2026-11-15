@@ -11,9 +11,6 @@ kl_threshold: 0.008
 lr_schedule: adaptive
 save_every: 1000
 diagnostic_every: 250
-control_hz: 60
-physics_hz: 120
-decimation: 2
 moving_average: 1.0
 physics_schedule: nominal
 contact_capacity: 128

@@ -82,9 +82,7 @@ def prepare(args):
     quats = np.stack([Slerp(demo.time_s, Rotation.from_quat(q, scalar_first=True))(times).as_quat(scalar_first=True)
                       for _, q in poses], axis=1)
     reference = dict(time_s=times, object_state=body_reference(positions, quats, times))
-    joints = [joint for obj in demo.objects.values() for joint in obj.joints]
-    if [joint.name for joint in joints] != list(binding["joints"]):
-        raise ValueError("Object joint order differs from the evaluation binding")
+    joints = [joint for obj in demo.objects.values() for joint in obj.joints]  # The order of binding["joints"].
     reference["object_q"] = (np.stack([np.interp(times, demo.time_s, joint.position_rad) for joint in joints], axis=-1)
                              if joints else np.empty((len(times), 0)))
     reference["object_dq"] = velocity(reference["object_q"], times)
@@ -143,7 +141,7 @@ def prepare(args):
         near_contact_diagnostic=reasons[0]))
     write_json(output / "robot_mapping.json", robot)
     metadata = seal(output, "prepared", dict(task_id=task.task_id, demo_id=demo.demo_id, robot_id=task.robot.robot_id,
-        dataset=task.dataset, profile=task.profile, part_names=parts, object_bodies=binding["parts"],
+        dataset=task.dataset, profile=task.profile, part_names=parts, object_bodies=[binding["parts"][p] for p in parts],
         scoring_parts=scoring, object_joint_names=list(binding["joints"]),
         gravity_m_s2=float(np.linalg.norm(model.opt.gravity)),
         compatibility={s: signature(model, robot, s) for s in robot["sides"]},

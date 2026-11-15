@@ -46,14 +46,6 @@ def test_unrepresentable_transition_is_rejected_instead_of_removed():
         wrist_windows(path, np.full(3, -6.2), np.full(3, 6.2))
 
 
-def test_previous_prepared_requires_explicit_repreparation(monkeypatch, tmp_path):
-    from maniptrans_h2r import imitator_env
-    monkeypatch.setattr(imitator_env, 'load_artifact', lambda path:
-                        (tmp_path, dict(format='maniptrans-h2r-pretrain-v1', partial=False, recipe={})))
-    with pytest.raises(ValueError, match='Re-prepare'):
-        imitator_env.ImitatorEnv(tmp_path, 1, 'cpu')
-
-
 def test_windowing_preserves_whole_clip_velocities(monkeypatch):
     count = 2100
     times = np.arange(count)/60

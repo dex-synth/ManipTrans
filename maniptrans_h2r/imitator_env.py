@@ -5,12 +5,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import torch
 
+from .clock import DECIMATION, PHYSICS_DT_S
 from .hand_reference import WristLimitError, WristReference
 from .io import load_artifact, read_json, sha256
 from .mjlab_env import MjlabVecEnv, hand_model
-from .motion import MotionCache, WINDOW_SCHEMA
+from .motion import MotionCache
 from .residual_reward import hand_reward
-from .robot_physics import require_compatibility
 
 
 WRIST_RSI = dict(max_attempts=64, fallback="unperturbed_reference_pose")
@@ -41,14 +41,9 @@ class ImitatorEnv(MjlabVecEnv):
 
     def __init__(self, prepared, count, device, seed=42, allow_partial=False, *, buffer_capacities=None, epa_recovery=None):
         self.epa_recovery = epa_recovery
-        self.path, metadata = load_artifact(prepared)
-        if metadata["format"] != "maniptrans-h2r-pretrain-v1":
-            raise ValueError("Expected generalist pretraining reference")
+        self.path, metadata = load_artifact(prepared, "pretrain")
         if metadata["partial"] and not allow_partial:
             raise ValueError("Partial corpus requires --allow-incomplete")
-        if metadata.get("recipe", {}).get("windowing") != WINDOW_SCHEMA:
-            raise ValueError("Re-prepare the corpus with wrist-feasible training windows")
-        require_compatibility(metadata["compatibility"])
         robot = read_json(self.path / "robot_mapping.json")
         self.side = robot["sides"][0]
         model, bodies = hand_model(self.path / "robot_scene.xml", robot)
@@ -70,7 +65,8 @@ class ImitatorEnv(MjlabVecEnv):
         return result
 
     def remaining_ticks(self):
-        return torch.as_tensor(2*(self.motion.lengths-1-self.motion.positions), device=self.device)
+        # The motion is sampled once per control period.
+        return torch.as_tensor(DECIMATION*(self.motion.lengths-1-self.motion.positions), device=self.device)
 
     def advance_reference(self):
         self.motion.advance()
@@ -103,8 +99,8 @@ class ImitatorEnv(MjlabVecEnv):
         dq[:, :6] = self.wrist.velocity(q[:, :6], v, w)
         self.views["qpos"][ids[:, None], torch.tensor(self.robot["qpos_indices"], device=self.device)] = torch.tensor(q, dtype=torch.float32, device=self.device)
         self.views["qvel"][ids[:, None], torch.tensor(self.robot["qvel_indices"], device=self.device)] = torch.tensor(dq, dtype=torch.float32, device=self.device)
-        self.tick[ids] = torch.as_tensor(self.motion.positions[indices]*2, device=self.device)
-        self.views["time"][ids] = self.tick[ids].float()/120
+        self.tick[ids] = torch.as_tensor(self.motion.positions[indices]*DECIMATION, device=self.device)
+        self.views["time"][ids] = self.tick[ids].float()*PHYSICS_DT_S
 
     def reward(self, state, target, power, actions):
         return hand_reward(self.robot, self.side, state, target, power, actions, self.completed_controls, self.scale)

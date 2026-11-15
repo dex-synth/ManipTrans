@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .clock import PHYSICS_DT_S
 from .control import CONTROL
 from .io import load_artifact, read_json, write_json
 from .policy import Policy, build
@@ -106,7 +107,7 @@ def residual_tracking(model, prepared, device, *, buffer_capacities=None):
     from .residual_env import ResidualEnv
     initialization = read_json(prepared / "initialization.json")
     report = dict(label="full-task tracking diagnostic", seed=43, strict_scale=.7,
-                  start_tick=0, initial_velocity="zero", physics_schedule="nominal")
+                  start_time_s=0., initial_velocity="zero", physics_schedule="nominal", physics_dt_s=PHYSICS_DT_S)
     if not initialization["valid"]:
         return dict(report, status="initialization_failed", success=False, coverage=0.,
                     collisions=initialization["collisions"])
@@ -133,9 +134,9 @@ def residual_tracking(model, prepared, device, *, buffer_capacities=None):
         transitions += 1
         if done[0]:
             break
-    return dict(report, status="completed", task_id=env.task["task_id"], success=bool(env.success_buf[0]),
-                failure=bool(env.failure_buf[0]), terminal_tick=int(env.tick[0]), end_tick=env.task["end_tick"],
-                coverage=float(env.tick[0]/env.task["end_tick"]), transitions=transitions,
+    return dict(report, status="completed", task_id=env.task.task_id, success=bool(env.success_buf[0]),
+                failure=bool(env.failure_buf[0]), terminal_time_s=float(env.tick[0])*PHYSICS_DT_S,
+                duration_s=env.task.duration_s, coverage=float(env.tick[0]/env.end_tick), transitions=transitions,
                 mean={k: v/transitions for k, v in sums.items()})
 
 
@@ -149,10 +150,10 @@ def residual_diagnostic_callback(prepared, output, device, *, buffer_capacities=
 
 
 def check_imitator(args):
-    root, meta = load_artifact(args.imitator, "imitator.json")
+    root, meta = load_artifact(args.imitator, "imitator")
     if meta.get("control") != CONTROL:
         raise ValueError("Imitator wrist control differs; use its original checkout or retrain with current control")
-    prepared, input_meta = load_artifact(args.prepared)
+    prepared, input_meta = load_artifact(args.prepared, "pretrain")
     if input_meta["id"] != meta["prepared_id"]:
         raise ValueError("Diagnostic corpus/reference differs from the trained imitator")
     output = Path(args.output)

@@ -4,9 +4,13 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from .io import read_json, sha256
+from .clock import PHYSICS_DT_S
+from .io import sha256
 
 CAPACITY = 64
+# The method's own pre-check of reset and initial poses. The evaluation's admission threshold is
+# an evaluation setting and is not given to methods.
+MAX_PENETRATION_M = 0.02
 PHYSICS_FIELDS = (
     "body_parentid", "body_pos", "body_quat", "body_mass", "body_ipos", "body_iquat", "body_inertia", "body_gravcomp",
     "jnt_type", "jnt_bodyid", "jnt_axis", "jnt_pos", "jnt_range", "jnt_limited", "jnt_actfrclimited",
@@ -31,12 +35,13 @@ def equal(actual, expected, name, rtol=2e-5, atol=1e-9):
         raise ValueError(f"Task physics mismatch: {name} ({actual.shape} vs {expected.shape})")
 
 
-def load_model(task_path, task, robot, *, all_contacts=False):
+def load_model(task, robot):
+    """The sealed task scene with observation sensors, stepped at the method's training step."""
     import mujoco
 
-    source = task_path / task["scene"]
+    source = task.scene_xml
     nominal = mujoco.MjModel.from_xml_path(str(source))
-    verify_sealed(nominal, read_json(task_path / "scene/compiled.json"))
+    verify_sealed(nominal, task.compiled)
     tree = ET.parse(source)
     for node in tree.iter():
         if "file" in node.attrib:
@@ -45,31 +50,21 @@ def load_model(task_path, task, robot, *, all_contacts=False):
     if sensors is None:
         sensors = ET.SubElement(tree.getroot(), "sensor")
     bodies = list(dict.fromkeys([b for h in robot["hands"].values() for b in h["bodies"]]
-                               + list(task["object"]["parts"].values())))
+                               + list(task.object_binding["parts"].values())))
     for i, body in enumerate(bodies):
         for tag in ("framepos", "framequat", "framelinvel", "frameangvel"):
             ET.SubElement(sensors, tag, name=f"mt_{tag}_{i}", objtype="xbody", objname=body)
     pairs = []
     for side in robot["sides"]:
         for tip, body in enumerate(robot["hands"][side]["contact_bodies"]):
-            if all_contacts:
-                # Exact geom selectors avoid including a fingertip body's descendants.
-                for geom in range(nominal.ngeom):
-                    if (nominal.geom_bodyid[geom] != nominal.body(body).id
-                            or not (nominal.geom_contype[geom] or nominal.geom_conaffinity[geom])):
-                        continue
-                    name = f"mt_contact_{len(pairs)}"
-                    ET.SubElement(sensors, "contact", name=name, geom1=nominal.geom(geom).name,
-                                  reduce="none", num=str(CAPACITY + 1), data="found force dist pos normal tangent")
-                    pairs.append((side, tip, name))
-                continue
-            selections = [{"body2": b} for b in task["object"]["parts"].values()]
-            for env in task.get("environment", {}).values():
-                selections.extend([{"geom2": g} for g in env["collision_geoms"]] if env["body"] == "world"
-                                  else [{"body2": env["body"]}])
-            for selection in selections:
+            # Net force on each fingertip from every partner, including the robot itself.
+            # Exact geom selectors avoid including a fingertip body's descendants.
+            for geom in range(nominal.ngeom):
+                if (nominal.geom_bodyid[geom] != nominal.body(body).id
+                        or not (nominal.geom_contype[geom] or nominal.geom_conaffinity[geom])):
+                    continue
                 name = f"mt_contact_{len(pairs)}"
-                ET.SubElement(sensors, "contact", name=name, body1=body, **selection,
+                ET.SubElement(sensors, "contact", name=name, geom1=nominal.geom(geom).name,
                               reduce="none", num=str(CAPACITY + 1), data="found force dist pos normal tangent")
                 pairs.append((side, tip, name))
     model = mujoco.MjModel.from_xml_string(ET.tostring(tree.getroot(), encoding="unicode"))
@@ -77,11 +72,12 @@ def load_model(task_path, task, robot, *, all_contacts=False):
         equal(getattr(model, name), getattr(nominal, name), name)
     for name in OPTION_FIELDS:
         equal(getattr(model.opt, name), getattr(nominal.opt, name), f"option.{name}")
-    equal(model.opt.timestep, task["dt_s"], "task.dt_s", rtol=0, atol=1e-12)
+    # Everything above is the sealed task; only the step is the method's own (see clock.py).
+    model.opt.timestep = PHYSICS_DT_S
     return model, bodies, pairs, sha256(source)
 
 
-def gpu_audit(cpu, gpu, task, scene_hash):
+def gpu_audit(cpu, gpu, task_id, scene_hash):
     import importlib.metadata
 
     values, options, missing = {}, {}, []
@@ -111,7 +107,7 @@ def gpu_audit(cpu, gpu, task, scene_hash):
     structural = {"exclude_signature"}
     if set(missing) - structural:
         raise ValueError(f"Cannot verify essential MJWarp physics fields: {sorted(set(missing)-structural)}")
-    return {"task_id": task["task_id"], "scene_sha256": scene_hash, "fields": values, "options": options,
+    return {"task_id": task_id, "scene_sha256": scene_hash, "fields": values, "options": options,
             "cpu_only_structural_fields": missing,
             "versions": {p: importlib.metadata.version(p) for p in ("mujoco", "mujoco-warp", "warp-lang", "torch")}}
 
@@ -157,10 +153,7 @@ def verify_sealed(model, compiled):
         equal(body.mass[0], values["mass_kg"], f"sealed.{name}.mass")
         equal(body.ipos, values["com_m"], f"sealed.{name}.com")
         equal(rotation @ np.diag(body.inertia) @ rotation.T, values["inertia_kg_m2"], f"sealed.{name}.inertia")
-    joints = base.get("joints", {"hinge": base.get("joint", {})})
-    for name, values in joints.items():
-        if not values:
-            continue
+    for name, values in base["joints"].items():
         joint = model.joint(f"object_{name}")
         dof = int(joint.dofadr[0])
         actual = dict(type=joint.type[0], limited=joint.limited[0], limits_rad=joint.range,
@@ -178,7 +171,7 @@ def sensor_columns(model, name):
     return slice(int(sensor.adr[0]), int(sensor.adr[0] + sensor.dim[0]))
 
 
-def check_initial_collision(model, qpos, threshold):
+def check_initial_collision(model, qpos, threshold=MAX_PENETRATION_M):
     import mujoco
 
     data = mujoco.MjData(model)
