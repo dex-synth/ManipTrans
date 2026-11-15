@@ -75,7 +75,8 @@ def prepare(args):
     robot = command_limits(model, mapping(model, task))
     # The method's reference grid: one sample per control period, plus the task endpoint.
     end = training_ticks(task.duration_s)
-    times = np.unique(np.r_[np.arange(0, end+1, DECIMATION), end])*PHYSICS_DT_S
+    ticks = np.unique(np.r_[np.arange(0, end+1, DECIMATION), end])
+    times = np.minimum(ticks*PHYSICS_DT_S, demo.time_s[-1])  # Roundoff must not leave the reference interval.
     parts, scoring = list(binding["parts"]), list(binding["scoring_parts"])
     poses = [demo.part_pose(part) for part in parts]
     positions = resample(np.stack([p for p, _ in poses], 1), demo.time_s, times)
