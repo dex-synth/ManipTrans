@@ -1,6 +1,6 @@
 # H2R Phase 1 imitator 适配说明
 
-本文仅比较通用单手 imitator 预训练。Upstream 基准为 `ManipTrans/ManipTrans@a3d08cf`；H2R 为当前 `virtual-wrist-position-v3 / training_revision=7`。
+本文仅比较通用单手 imitator 预训练。Upstream 基准为 `ManipTrans/ManipTrans@a3d08cf`；H2R 为当前 `virtual-wrist-position-v3 / training_revision=8`。
 
 Upstream 参数取 `main/cfg/config.yaml`、`DexHandImitator.yaml` 和 `DexHandImitatorPPO.yaml` 合并后的有效默认值，不采用 README 中其他任务的命令行覆盖。两列使用相同计数口径；实际运行覆盖值以产物 recipe 为准。
 
@@ -22,7 +22,7 @@ Upstream 参数取 `main/cfg/config.yaml`、`DexHandImitator.yaml` 和 `DexHandI
 | --- | --- | --- |
 | 机器人资产 | 原生 URDF 手，默认 `inspire` | 从共同 task 的 MJCF 抽取 Sharpa 单手，继承实际增益、惯量、碰撞及限位 |
 | 物理后端 | IsaacGym / PhysX | mjlab 1.6 `Simulation` / MJWarp |
-| 时间步 | `dt=0.0166667`，2 substeps | 控制 60 Hz、物理 120 Hz、decimation=2 |
+| 时间步 | `dt=0.0166667`，2 substeps | 控制 60 Hz、物理 120 Hz、decimation=2；步长由方法在 `clock.py` 中设定并写入抽取的单手模型，不继承 task 的名义步长（300 Hz） |
 | 手腕表示 | 自由浮动根 | 6 个有限位虚拟关节；旋转使用连续 Euler 分支 |
 | 腕执行器 | 默认直接施加外力／力矩，另有可选 PID；线性／角阻尼均为 20 | 使用共同位置执行器及其增益、阻尼；不新增外部 wrench 或速度补偿 |
 | 腕动作解码 | 力为 `a_xyz × dt × 1.0 × 500`，力矩为 `a_rot × dt × 0.1 × 200` | `q_target = q_actual(t) + scale × a`；平移 scale=0.12 m，旋转 scale=1.0 rad |
@@ -49,7 +49,7 @@ Upstream 参数取 `main/cfg/config.yaml`、`DexHandImitator.yaml` 和 `DexHandI
 | 数据集／左右来源权重 | 由 `dataIndices` 的内容及分配次数决定 | 四数据集等概率、源左右侧等概率；池内按有效转移时长加权 |
 | 真实／合成比例 | 所选原生加载路径没有此固定混合配方 | 90% 真实、10% MANO 端点旋转 SLERP 合成；合成段在源片段允许范围内取 0.5–5 s |
 | 镜像选择 | 数据索引的 `M` 后缀区分镜像数据类型 | 源侧与目标手不同时自动镜像 |
-| 时间与姿态重建 | 各 loader 构造原生参考；基础速度计算使用固定采样间隔，默认 `skip=2` 对应 60 Hz | MANO 在 60 Hz 解码／插值并恢复真实腕轨迹；核验 MANO 资产与源关键点重建 |
+| 时间与姿态重建 | 各 loader 构造原生参考；基础速度计算使用固定采样间隔，默认 `skip=2` 对应 60 Hz | MANO 在 60 Hz 插值，经共同 decoder（`h2r_io.mano`）解码并恢复真实腕轨迹；核验 MANO 资产与源关键点重建 |
 | 速度 | 固定时间间隔差分，Gaussian 平滑 sigma=2 | 按实际采样时间差分，保留 sigma=2；虚拟腕关节速度另经 Jacobian 换算 |
 | 长序列 | 超过 2000 帧时截断 | 先计算完整参考，再切成至多 2000 样本的腕限位可行窗口；相邻窗口共享端点，全部源转移恰好覆盖一次 |
 | 腕角连续性与非法参考 | 自由根不需要满足虚拟腕关节的 Euler 分支限位 | 每窗固定等价分支和 `2π` 偏移，episode 内不换圈；不能表示的参考报错，不扩大共同限位 |
@@ -105,9 +105,8 @@ Upstream PPO YAML 中 `max_epochs=10000`、`early_stop_epochs=500` 是 fallback�
 | 训练输入／产物 | 原生 dataset 与 checkpoint | 版本化 prepared 与左右手独立 imitator 产物，封存参考、物理、控制和训练配方身份 |
 | 数值检查 | 原生训练与 checkpoint 保存逻辑 | 增加原始模型输出、梯度、更新后参数、normalizer 和 checkpoint 的非有限值检查 |
 | Resume 内容 | 保存模型、归一化、优化器、epoch/frame、最佳奖励等状态 | 保留这些内容，额外保存学习率调度、各 RNG、采样／RSI 计数、课程控制步数及配方绑定；恢复时重置物理世界，不保证逐位连续 |
-| 参考与控制身份 | 原生机器人及自由腕 wrench 契约 | `virtual-wrist-position-v3`、`hand-reference-v3`、`preparation_revision=2`（`wrist-feasible-v1`）、`training_revision=7` |
-| 旧 checkpoint／resume | 按原生观测、动作和恢复逻辑使用 | 原生 wrench checkpoint 不能直接使用；旧 H2R base 必须重训，旧 revision 或不同 worlds 的 resume 拒绝续接；满足当前参考签名的 prepared 可复用 |
-| 旧 H2R 部署 | 不适用 | v1/v2 部署仍按其 `q_ref(t_next) + delta` 契约解码；当前 v3 使用实测 q 加增量，避免静默改变旧模型含义 |
+| 参考与控制身份 | 原生机器人及自由腕 wrench 契约 | `virtual-wrist-position-v3`、`hand-reference-v3`、`maniptrans-hand-physics-v3`、窗口 `wrist-feasible-v1`、`training_revision=8`；产物格式 `maniptrans-h2r-pretrain-v2`／`imitator-v2` |
+| 旧 checkpoint／resume | 按原生观测、动作和恢复逻辑使用 | 原生 wrench checkpoint 不能直接使用；此前格式的 prepared、base、deployment 和 resume 一律拒绝，须重新 prepare 并重训；不同 worlds 的 resume 拒绝续接 |
 | 固定跟踪诊断 | 没有这套 H2R corpus 回调；原生测试模式的阈值 scale=1 | epoch 0、每 250 epochs、实际训练结束时诊断；seed=43、严格 scale=0.7；最终执行均值和随机策略诊断，覆盖提前停止，隔离训练 RNG |
 | 诊断指标 | 原生奖励／训练日志 | 记录腕与关键点误差、功率、有效前缀和时域覆盖；`wrist_action_saturation` 为 soft clamp 后六维腕动作绝对值至少 .95 的比例 |
 | 诊断结果用途 | 按原生训练／测试入口解释 | tracking diagnostic 与训练 corpus 重叠，仅衡量手部跟踪，不代表未见数据泛化或物体操作成功率 |

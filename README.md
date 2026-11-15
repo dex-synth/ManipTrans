@@ -32,7 +32,7 @@ ______________________________________________________________________
 
 ## 📑 Table of Contents
 
-For sealed h2r_bench inputs, MJWarp two-stage training and unified physical evaluation,
+For h2r_bench task packages, MJWarp two-stage training and unified physical evaluation,
 see [the H2R integration guide](docs/h2r.md). This path uses the common six-joint
 virtual wrist with position targets and an independent Python 3.11 environment.
 
