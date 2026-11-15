@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("train", nargs=argparse.REMAINDER, help="After --: options passed to maniptrans_h2r.train")
     args = parser.parse_args()
+    train_options = args.train[1:] if args.train[:1] == ["--"] else args.train  # argparse keeps the separator before 3.13.
     cases = load_suite(args.suite).cases
     unknown = set(args.case or ()) - {case.case_id for case in cases}
     if unknown:
@@ -64,7 +65,7 @@ def main():
                 result["reason"] = f"no given base matches the {' and '.join(missing)} hand physics of this task"
             elif run("train", ["--prepared", str(prepared), "--output", str(deployment), "--device", args.device,
                                *(item for side, path in chosen.items() for item in (f"--imitator-{side}", path)),
-                               *args.train[1:]], root / "train.log"):
+                               *train_options], root / "train.log"):
                 result["reason"] = "training failed, see train.log"
         if "reason" in result:
             failed = True

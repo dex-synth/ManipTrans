@@ -122,3 +122,36 @@ def test_start_declares_the_policy_period_on_the_announced_physics_step(controll
 def test_start_rejects_other_protocols_tasks_and_reduced_contacts(controller, changes, message):
     with pytest.raises(ValueError, match=message):
         controller.start(hello(**changes))
+
+
+def test_suite_driver_picks_bases_by_signature_and_keeps_failed_cases(tmp_path, monkeypatch):
+    from maniptrans_h2r import suite
+    cases = [SimpleNamespace(case_id="set/a++b/hand", task_id="1", task=tmp_path / "first"),
+             SimpleNamespace(case_id="set/taco/hand", task_id="2", task=tmp_path / "second")]
+    monkeypatch.setattr(suite, "load_suite", lambda path: SimpleNamespace(cases=cases))
+    bases = {"right": dict(side="right", compatibility=dict(friction=2.)), "left": dict(side="left", compatibility=dict(friction=2.)),
+             "taco-right": dict(side="right", compatibility=dict(friction=.8))}
+    prepared = {"set-a__b-hand": dict(right=dict(friction=2.), left=dict(friction=2.)),
+                "set-taco-hand": dict(right=dict(friction=.8), left=dict(friction=.8))}
+    monkeypatch.setattr(suite, "load_artifact", lambda path, kind: (None, bases[path] if kind == "imitator" else
+                                                                    dict(compatibility=prepared[path.parent.name])))
+    calls = []
+
+    def run(module, arguments, log):
+        calls.append((module, arguments))
+        return 0
+
+    monkeypatch.setattr(suite, "run", run)
+    monkeypatch.setattr("sys.argv", ["suite", "--suite", "suite", "--output", str(tmp_path / "out"), "--imitator", *bases,
+                                     "--iterations", "7", "--", "--epochs", "3"])
+    with pytest.raises(SystemExit) as stopped:
+        suite.main()
+    assert stopped.value.code == 1  # The second case has no left base with its contact parameters.
+    assert [module for module, _ in calls] == ["prepare", "train", "prepare"]
+    prepare, train = calls[0][1], calls[1][1]
+    assert prepare[prepare.index("--task")+1] == str(tmp_path / "first") and prepare[prepare.index("--iterations")+1] == "7"
+    assert train[train.index("--imitator-right")+1] == "right" and train[train.index("--imitator-left")+1] == "left"
+    assert train[-2:] == ["--epochs", "3"]
+    results = [read_json(tmp_path / "out" / name / "result.json") for name in prepared]
+    assert [result["status"] for result in results] == ["completed", "failed"]
+    assert "no given base matches the left hand physics" in results[1]["reason"]
